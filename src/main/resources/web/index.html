@@ -1,0 +1,696 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="robots" content="noindex, nofollow">
+    <meta name="color-scheme" content="dark">
+    <meta name="theme-color" content="#0F172A">
+    <title>Mods Manager</title>
+    <link rel="icon" href="favicon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="style.css">
+    <!-- Конфигурация тем с сервера (доступные темы, выключенные, кастомные,
+         тема/вариант по умолчанию) — ДО инлайн-скрипта ниже: он использует
+         window.MODS_THEMES. Отдаётся модулем динамически (не из web-каталога). -->
+    <script src="theme.js"></script>
+    <script>
+        /* Тема оформления до первой отрисовки: localStorage/?theme=/&mode= ->
+           data-theme + data-mode на <html> (иначе была бы вспышка дефолтной
+           темой при загрузке). Конфигурацию тем (window.MODS_THEMES) сервер
+           отдал в theme.js; при локальном открытии файла — запасной glass/dark. */
+        (function () {
+            var IDS = ["glass", "comic", "simple", "neon", "pixel", "terminal"];
+            var M = window.MODS_THEMES || {};
+            var dis = M.disabled || [];
+            var customs = M.custom || [];
+            function available(t) {
+                if (!t) return false;
+                if (IDS.indexOf(t) >= 0) return dis.indexOf(t) < 0;
+                for (var i = 0; i < customs.length; i++) {
+                    if (customs[i] && ("c-" + customs[i].id) === t) return true;
+                }
+                return false;
+            }
+            var def = available(M.defaultTheme) ? M.defaultTheme : "glass";
+            var defMode = M.defaultMode === "light" ? "light" : "dark";
+            var t = null, m = null;
+            try {
+                var q = new URLSearchParams(location.search);
+                t = q.get("theme");
+                m = q.get("mode");
+                var saved = localStorage.getItem("mods_theme");
+                var savedMode = localStorage.getItem("mods_mode");
+                if (available(t)) {
+                    // URL-параметры сильнее сохранённого (демо-ссылки ?theme=)
+                    if (m !== "light" && m !== "dark") m = (savedMode === "light" || savedMode === "dark") ? savedMode : defMode;
+                } else {
+                    t = available(saved) ? saved : def;
+                    m = (savedMode === "light" || savedMode === "dark") ? savedMode : defMode;
+                }
+            } catch (e) {
+                t = def;
+                m = defMode;
+            }
+            document.documentElement.setAttribute("data-theme", t);
+            document.documentElement.setAttribute("data-mode", m);
+            var METAS = { glass: ["#E9F0F9", "#0F172A"], comic: ["#FBEFD3", "#211A10"],
+                simple: ["#F5F6F8", "#101318"], neon: ["#F2FDFF", "#05070E"],
+                pixel: ["#E7E9DC", "#23252B"], terminal: ["#F3F7EE", "#020A04"] };
+            var meta = document.querySelector('meta[name="theme-color"]');
+            if (meta && METAS[t]) meta.setAttribute("content", m === "light" ? METAS[t][0] : METAS[t][1]);
+            var scheme = document.querySelector('meta[name="color-scheme"]');
+            if (scheme) scheme.setAttribute("content", m);
+        })();
+    </script>
+</head>
+<body>
+
+<!-- ============ SVG-спрайт (иконки в стиле Lucide, stroke) ============ -->
+<svg xmlns="http://www.w3.org/2000/svg" class="svg-sprite" aria-hidden="true" focusable="false">
+    <defs>
+        <symbol id="i-package" viewBox="0 0 24 24"><path d="M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16Z"/><path d="m3.3 7 8.7 5 8.7-5"/><path d="M12 22V12"/></symbol>
+        <symbol id="i-shield" viewBox="0 0 24 24"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="m9 12 2 2 4-4"/></symbol>
+        <symbol id="i-shield-x" viewBox="0 0 24 24"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="m9.5 9.5 5 5"/><path d="m14.5 9.5-5 5"/></symbol>
+        <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/></symbol>
+        <symbol id="i-download" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></symbol>
+        <symbol id="i-zap" viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></symbol>
+        <symbol id="i-hash" viewBox="0 0 24 24"><line x1="4" y1="9" x2="20" y2="9"/><line x1="4" y1="15" x2="20" y2="15"/><line x1="10" y1="3" x2="8" y2="21"/><line x1="16" y1="3" x2="14" y2="21"/></symbol>
+        <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></symbol>
+        <symbol id="i-log-in" viewBox="0 0 24 24"><path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/><polyline points="10 17 15 12 10 7"/><line x1="15" y1="12" x2="3" y2="12"/></symbol>
+        <symbol id="i-log-out" viewBox="0 0 24 24"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></symbol>
+        <symbol id="i-ban" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="m4.9 4.9 14.2 14.2"/></symbol>
+        <symbol id="i-filter" viewBox="0 0 24 24"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></symbol>
+        <symbol id="i-file" viewBox="0 0 24 24"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/><path d="M10 9H8"/><path d="M16 13H8"/><path d="M16 17H8"/></symbol>
+        <symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+        <symbol id="i-user" viewBox="0 0 24 24"><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></symbol>
+        <symbol id="i-check" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></symbol>
+        <symbol id="i-x" viewBox="0 0 24 24"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></symbol>
+        <symbol id="i-alert" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 8v4"/><path d="M12 16h.01"/></symbol>
+        <symbol id="i-warn" viewBox="0 0 24 24"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3"/><path d="M12 9v4"/><path d="M12 17h.01"/></symbol>
+        <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/></symbol>
+        <symbol id="i-trash" viewBox="0 0 24 24"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></symbol>
+        <symbol id="i-settings" viewBox="0 0 24 24"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></symbol>
+        <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></symbol>
+        <symbol id="i-note" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></symbol>
+        <symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20"/><path d="M2 12h20"/></symbol>
+        <symbol id="i-arrow-r" viewBox="0 0 24 24"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></symbol>
+        <symbol id="i-eye" viewBox="0 0 24 24"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></symbol>
+        <symbol id="i-eye-off" viewBox="0 0 24 24"><path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 10 7 10 7a13.16 13.16 0 0 1-1.67 2.68"/><path d="M6.61 6.61A13.526 13.526 0 0 0 2 11s3 7 10 7a9.74 9.74 0 0 0 5.39-1.61"/><path d="m2 2 20 20"/><path d="M9.88 9.88a3 3 0 1 0 4.24 4.24"/></symbol>
+        <symbol id="i-inbox" viewBox="0 0 24 24"><polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></symbol>
+        <symbol id="i-chevron-l" viewBox="0 0 24 24"><path d="m15 18-6-6 6-6"/></symbol>
+        <symbol id="i-chevron-r" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></symbol>
+        <symbol id="i-chevron-u" viewBox="0 0 24 24"><path d="m18 15-6-6-6 6"/></symbol>
+        <symbol id="i-chevron-d" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></symbol>
+        <symbol id="i-folder-open" viewBox="0 0 24 24"><path d="m6 14 1.5-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.54 6a2 2 0 0 1-1.95 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H18a2 2 0 0 1 2 2v2"/></symbol>
+        <symbol id="i-plus" viewBox="0 0 24 24"><path d="M5 12h14"/><path d="M12 5v14"/></symbol>
+        <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></symbol>
+        <symbol id="i-layers" viewBox="0 0 24 24"><path d="m12.83 2.18a2 2 0 0 0-1.66 0L2.6 6.08a1 1 0 0 0 0 1.83l8.58 3.91a2 2 0 0 0 1.66 0l8.58-3.9a1 1 0 0 0 0-1.83Z"/><path d="m22 17.65-9.17 4.16a2 2 0 0 1-1.66 0L2 17.65"/><path d="m22 12.65-9.17 4.16a2 2 0 0 1-1.66 0L2 12.65"/></symbol>
+        <symbol id="i-send" viewBox="0 0 24 24"><path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/></symbol>
+        <symbol id="i-image" viewBox="0 0 24 24"><rect width="18" height="18" x="3" y="3" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/></symbol>
+        <symbol id="i-sparkles" viewBox="0 0 24 24"><path d="M9.937 15.5A2 2 0 0 0 8.5 14.063l-6.135-1.582a.5.5 0 0 1 0-.962L8.5 9.936A2 2 0 0 0 9.937 8.5l1.582-6.135a.5.5 0 0 1 .963 0L14.063 8.5A2 2 0 0 0 15.5 9.937l6.135 1.581a.5.5 0 0 1 0 .964L15.5 14.063a2 2 0 0 0-1.437 1.437l-1.582 6.135a.5.5 0 0 1-.963 0z"/></symbol>
+        <symbol id="i-palette" viewBox="0 0 24 24"><path d="M12 22a1 1 0 0 1 0-20 10 9 0 0 1 10 9 5 5 0 0 1-5 5h-2.25a1.75 1.75 0 0 0-1.4 2.8l.3.4a1.75 1.75 0 0 1-1.4 2.8z"/><circle cx="13.5" cy="6.5" r=".5" fill="currentColor"/><circle cx="17.5" cy="10.5" r=".5" fill="currentColor"/><circle cx="6.5" cy="12.5" r=".5" fill="currentColor"/><circle cx="8.5" cy="7.5" r=".5" fill="currentColor"/></symbol>
+        <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/></symbol>
+        <symbol id="i-moon" viewBox="0 0 24 24"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></symbol>
+    </defs>
+</svg>
+
+<!-- ============ Фоновое свечение (glassmorphism backdrop) ============ -->
+<div class="bg-decor" aria-hidden="true">
+    <div class="bg-blob bg-blob-a"></div>
+    <div class="bg-blob bg-blob-b"></div>
+    <div class="bg-blob bg-blob-c"></div>
+    <div class="bg-grid"></div>
+</div>
+
+<div id="app">
+
+    <!-- ================= ВХОД ================= -->
+    <div id="view-login" class="view login-view hidden">
+        <button class="icon-btn theme-btn-login" id="btn-theme-login" type="button" title="Theme">
+            <svg class="icon" aria-hidden="true"><use href="#i-palette"/></svg>
+        </button>
+        <form id="login-form" class="login-card" autocomplete="off">
+            <div class="login-logo">
+                <img src="favicon.svg" alt="">
+            </div>
+            <h1 id="login-title">Mods Manager</h1>
+            <p class="login-subtitle" data-i18n="login.subtitle">Управление модами Modrinth и CurseForge для LaunchServer</p>
+            <label>
+                <span data-i18n="login.login">Логин</span>
+                <input type="text" id="login-login" required maxlength="256" autocomplete="username">
+            </label>
+            <label>
+                <span data-i18n="login.password">Пароль</span>
+                <span class="input-wrap">
+                    <input type="password" id="login-password" required maxlength="256" autocomplete="current-password">
+                    <button type="button" class="icon-btn pass-toggle" id="btn-pass-toggle" aria-label="Show password">
+                        <svg class="icon" aria-hidden="true"><use href="#i-eye"/></svg>
+                    </button>
+                </span>
+            </label>
+            <label id="login-totp-label" class="hidden">
+                <span data-i18n="login.totp">Код 2FA (TOTP)</span>
+                <input type="text" id="login-totp" maxlength="12" inputmode="numeric" autocomplete="one-time-code">
+            </label>
+            <button type="submit" class="btn primary btn-block" id="login-submit">
+                <svg class="icon" aria-hidden="true"><use href="#i-log-in"/></svg><span data-i18n="login.submit">Войти</span>
+            </button>
+            <div id="login-error" class="login-error hidden" role="alert"></div>
+        </form>
+        <p class="login-footer muted small">LaunchServer · ModsSite module</p>
+    </div>
+
+    <!-- ================= ОСНОВНОЙ ВИД ================= -->
+    <div id="view-main" class="view hidden">
+        <header class="topbar">
+            <div class="topbar-left">
+                <img src="favicon.svg" alt="" class="topbar-logo">
+                <span id="topbar-title" class="topbar-title">Mods Manager</span>
+                <span id="topbar-version" class="muted small version-chip"></span>
+            </div>
+            <div class="topbar-right">
+                <span id="source-badges" class="source-badges"></span>
+                <span id="user-badge" class="user-badge"></span>
+                <button class="btn ghost small" id="btn-theme" type="button" title="Theme">
+                    <svg class="icon" aria-hidden="true"><use href="#i-palette"/></svg><span id="theme-label">Glass</span>
+                </button>
+                <button class="btn ghost small" id="btn-lang" title="Language / Язык" type="button">
+                    <svg class="icon" aria-hidden="true"><use href="#i-globe"/></svg><span id="lang-label">EN</span>
+                </button>
+                <button class="btn ghost small" id="btn-logout" type="button">
+                    <svg class="icon" aria-hidden="true"><use href="#i-log-out"/></svg><span data-i18n="topbar.logout">Выйти</span>
+                </button>
+            </div>
+        </header>
+
+        <div class="layout">
+        <nav class="mainnav" role="tablist">
+            <button class="navtab active" id="tab-mods" type="button" role="tab" aria-selected="true">
+                <svg class="icon" aria-hidden="true"><use href="#i-package"/></svg><span data-i18n="nav.mods">Моды</span>
+            </button>
+            <button class="navtab" id="tab-search" type="button" role="tab" aria-selected="false">
+                <svg class="icon" aria-hidden="true"><use href="#i-search"/></svg><span data-i18n="nav.search">Поиск</span>
+            </button>
+            <button class="navtab hidden" id="tab-suggest" type="button" role="tab" aria-selected="false">
+                <svg class="icon" aria-hidden="true"><use href="#i-send"/></svg><span data-i18n="nav.suggest">Предложения</span> <span class="cnt" id="cnt-suggest"></span>
+            </button>
+            <button class="navtab hidden" id="tab-settings" type="button" role="tab" aria-selected="false">
+                <svg class="icon" aria-hidden="true"><use href="#i-settings"/></svg><span data-i18n="nav.settings">Настройки</span>
+            </button>
+        </nav>
+
+        <!-- ---------- ПАНЕЛЬ МОДОВ ---------- -->
+        <main id="panel-mods" class="panel">
+            <div id="profiles-bar" class="profiles-bar"></div>
+
+            <!-- Фильтры, поиск по установленным и сортировка списка модов
+                 (как в Modrinth: слева чипы, справа выпадающая сортировка).
+                 Поиск — живой фильтр по УСТАНОВЛЕННЫМ модам (имя/файл/id),
+                 выбор источника тут не нужен. Состояние — только клиентское. -->
+            <div class="mod-filter-bar">
+                <div class="chip-group" role="group" aria-label="Content type">
+                    <button class="chip" id="filter-kind-mod" type="button">
+                        <svg class="icon" aria-hidden="true"><use href="#i-package"/></svg><span data-i18n="kind.mod">Моды</span> <span class="cnt" id="cnt-kind-mod"></span>
+                    </button>
+                    <button class="chip" id="filter-kind-resourcepack" type="button">
+                        <svg class="icon" aria-hidden="true"><use href="#i-image"/></svg><span data-i18n="kind.resourcepack">Ресурспаки</span> <span class="cnt" id="cnt-kind-resourcepack"></span>
+                    </button>
+                    <button class="chip" id="filter-kind-shader" type="button">
+                        <svg class="icon" aria-hidden="true"><use href="#i-sparkles"/></svg><span data-i18n="kind.shader">Шейдеры</span> <span class="cnt" id="cnt-kind-shader"></span>
+                    </button>
+                </div>
+                <div class="chip-group" role="group" aria-label="Filters">
+                    <button class="chip" id="filter-optional" type="button">
+                        <svg class="icon" aria-hidden="true"><use href="#i-settings"/></svg><span data-i18n="mods.filterOptional">Опциональные</span> <span class="cnt" id="cnt-optional"></span>
+                    </button>
+                    <button class="chip" id="filter-updates" type="button">
+                        <svg class="icon" aria-hidden="true"><use href="#i-refresh"/></svg><span data-i18n="mods.filterUpdates">С обновлениями</span> <span class="cnt" id="cnt-updates"></span>
+                    </button>
+                </div>
+                <span class="input-wrap search-wrap mod-search-wrap">
+                    <svg class="icon search-icon" aria-hidden="true"><use href="#i-search"/></svg>
+                    <input type="text" id="mod-search" class="input" data-i18n-placeholder="mods.searchInstalled"
+                           placeholder="Поиск по установленным…" maxlength="128" autocomplete="off">
+                    <button class="icon-btn clear-btn hidden" id="mod-search-clear" type="button"
+                            data-i18n-title="mods.searchClear" title="Очистить" tabindex="-1">
+                        <svg class="icon" aria-hidden="true"><use href="#i-x"/></svg>
+                    </button>
+                </span>
+                <label class="sort-label">
+                    <svg class="icon" aria-hidden="true"><use href="#i-filter"/></svg>
+                    <span class="muted small" data-i18n="mods.sort">Сортировка</span>
+                    <select id="mod-sort" class="input select" aria-label="Sort">
+                        <option value="default" data-i18n="sort.default">По умолчанию</option>
+                        <option value="name-asc" data-i18n="sort.nameAsc">А-Я</option>
+                        <option value="name-desc" data-i18n="sort.nameDesc">Я-А</option>
+                    </select>
+                </label>
+            </div>
+
+            <div class="toolbar">
+                <div class="toolbar-group">
+                    <button class="btn" id="btn-check" type="button">
+                        <svg class="icon" aria-hidden="true"><use href="#i-refresh"/></svg><span data-i18n="mods.check">Проверить обновления</span>
+                    </button>
+                    <button class="btn" id="btn-update-all" type="button">
+                        <svg class="icon" aria-hidden="true"><use href="#i-download"/></svg><span data-i18n="mods.updateAll">Обновить всё</span>
+                    </button>
+                    <button class="btn warn" id="btn-rehash" type="button">
+                        <svg class="icon" aria-hidden="true"><use href="#i-hash"/></svg><span data-i18n="mods.rehash">Обновить хэши</span>
+                    </button>
+                    <button class="btn" id="btn-reload-profile" type="button" title="profiles/*.json">
+                        <svg class="icon" aria-hidden="true"><use href="#i-folder-open"/></svg><span data-i18n="mods.reloadProfile">Перечитать профиль</span>
+                    </button>
+                    <button class="btn primary" id="btn-apply" type="button">
+                        <svg class="icon" aria-hidden="true"><use href="#i-zap"/></svg><span data-i18n="mods.apply">Применить состав</span>
+                    </button>
+                </div>
+                <div class="toolbar-group grow">
+                    <span id="pack-stats" class="pack-stats"></span>
+                </div>
+            </div>
+
+            <div id="pack-meta" class="pack-meta"></div>
+            <div id="mods-grid" class="mods-grid"></div>
+            <div id="mods-empty" class="empty hidden"></div>
+        </main>
+
+        <!-- ---------- ПАНЕЛЬ ПОИСКА (каталог с фильтрами как в Modrinth/Prism) ---------- -->
+        <main id="panel-search" class="panel hidden">
+            <div class="search-toolbar">
+                <select id="search-type" class="input select" aria-label="Content type">
+                    <option value="mod" data-i18n="kind.mod">Моды</option>
+                    <option value="resourcepack" data-i18n="kind.resourcepack">Ресурспаки</option>
+                    <option value="shader" data-i18n="kind.shader">Шейдеры</option>
+                </select>
+                <select id="search-source" class="input select" aria-label="Source">
+                    <option value="modrinth">Modrinth</option>
+                    <option value="curseforge">CurseForge</option>
+                </select>
+                <span class="input-wrap search-wrap grow">
+                    <svg class="icon search-icon" aria-hidden="true"><use href="#i-search"/></svg>
+                    <input type="text" id="search-query" class="input" data-i18n-placeholder="search.placeholder"
+                           placeholder="Поиск по каталогу…" maxlength="128">
+                </span>
+                <button class="btn primary" id="btn-search-run" type="button">
+                    <svg class="icon" aria-hidden="true"><use href="#i-search"/></svg><span data-i18n="mods.search">Найти</span>
+                </button>
+                <button class="btn ghost" id="btn-search-reset" type="button">
+                    <svg class="icon" aria-hidden="true"><use href="#i-x"/></svg><span data-i18n="search.reset">Сбросить</span>
+                </button>
+            </div>
+
+            <div class="search-layout">
+                <aside class="search-filters" aria-label="Filters">
+                    <div class="filter-group">
+                        <h3 class="filter-title"><svg class="icon" aria-hidden="true"><use href="#i-zap"/></svg><span data-i18n="search.loader">Загрузчик</span></h3>
+                        <div class="chip-group" id="loader-chips"></div>
+                    </div>
+                    <div class="filter-group">
+                        <h3 class="filter-title"><svg class="icon" aria-hidden="true"><use href="#i-package"/></svg><span data-i18n="search.gameVersion">Версия игры</span></h3>
+                        <input type="text" id="filter-version" class="input" list="mc-versions"
+                               data-i18n-placeholder="search.anyVersion" placeholder="любая" maxlength="16">
+                        <datalist id="mc-versions"></datalist>
+                    </div>
+                    <div class="filter-group">
+                        <h3 class="filter-title"><svg class="icon" aria-hidden="true"><use href="#i-arrow-r"/></svg><span data-i18n="search.sort">Сортировка</span></h3>
+                        <select id="filter-sort" class="input select">
+                            <option value="relevance" data-i18n="sort.relevance">По релевантности</option>
+                            <option value="downloads" data-i18n="sort.downloads">По загрузкам</option>
+                            <option value="follows" data-i18n="sort.follows">По подпискам</option>
+                            <option value="newest" data-i18n="sort.newest">Сначала новые</option>
+                            <option value="updated" data-i18n="sort.updated">Недавно обновлённые</option>
+                        </select>
+                    </div>
+                    <div class="filter-group">
+                        <h3 class="filter-title"><svg class="icon" aria-hidden="true"><use href="#i-filter"/></svg><span data-i18n="search.categories">Категории</span></h3>
+                        <div id="filter-cats" class="cat-list"></div>
+                    </div>
+                    <div class="filter-group hidden" id="mine-group">
+                        <h3 class="filter-title"><svg class="icon" aria-hidden="true"><use href="#i-send"/></svg><span data-i18n="suggest.mineTitle">Мои предложения</span> <span class="cnt" id="mine-count"></span></h3>
+                        <div id="mine-list" class="mine-list"></div>
+                    </div>
+                </aside>
+                <section class="search-results">
+                    <div class="result-meta" id="search-meta"></div>
+                    <div id="search-warning" class="search-warning hidden"></div>
+                    <div id="search-grid" class="results-grid"></div>
+                    <div id="search-empty" class="empty hidden"></div>
+                    <div class="pager">
+                        <button class="btn" id="btn-search-prev" type="button" disabled>
+                            <svg class="icon" aria-hidden="true"><use href="#i-chevron-l"/></svg><span data-i18n="search.prev">Назад</span>
+                        </button>
+                        <span id="search-page" class="muted small"></span>
+                        <button class="btn" id="btn-search-next" type="button" disabled>
+                            <span data-i18n="search.next">Далее</span><svg class="icon" aria-hidden="true"><use href="#i-chevron-r"/></svg>
+                        </button>
+                    </div>
+                </section>
+            </div>
+        </main>
+
+        <!-- ---------- ПАНЕЛЬ ПРЕДЛОЖЕНИЙ (админ) ---------- -->
+        <main id="panel-suggest" class="panel hidden">
+            <div class="suggest-toolbar">
+                <span class="input-wrap search-wrap grow">
+                    <svg class="icon search-icon" aria-hidden="true"><use href="#i-search"/></svg>
+                    <input type="text" id="suggest-search" class="input" data-i18n-placeholder="suggest.searchPlaceholder"
+                           placeholder="Поиск по названию или пользователю…" maxlength="128" autocomplete="off">
+                </span>
+                <select id="suggest-kind" class="input select" aria-label="Type filter">
+                    <option value="" data-i18n="suggest.allTypes">Все типы</option>
+                    <option value="mod" data-i18n="kind.mod">Моды</option>
+                    <option value="resourcepack" data-i18n="kind.resourcepack">Ресурспаки</option>
+                    <option value="shader" data-i18n="kind.shader">Шейдеры</option>
+                </select>
+                <button class="btn ghost" id="btn-suggest-refresh" type="button">
+                    <svg class="icon" aria-hidden="true"><use href="#i-refresh"/></svg><span data-i18n="admin.refresh">Обновить</span>
+                </button>
+            </div>
+            <div class="table-wrap">
+                <table class="table" id="table-suggest">
+                    <thead>
+                    <tr>
+                        <th data-i18n="suggest.colUser">Пользователь</th>
+                        <th data-i18n="suggest.colType">Тип</th>
+                        <th data-i18n="suggest.colProject">Проект</th>
+                        <th data-i18n="suggest.colProfile">Профиль</th>
+                        <th data-i18n="suggest.colDate">Дата</th>
+                        <th></th>
+                    </tr>
+                    </thead>
+                    <tbody></tbody>
+                </table>
+            </div>
+        </main>
+
+        <!-- ---------- ПАНЕЛЬ НАСТРОЕК (админ): обновления + безопасность ---------- -->
+        <main id="panel-settings" class="panel hidden">
+            <nav class="subnav">
+                <button class="subnavtab active" id="subtab-settings-updates" type="button">
+                    <svg class="icon" aria-hidden="true"><use href="#i-refresh"/></svg><span data-i18n="settings.updates">Обновления</span>
+                </button>
+                <button class="subnavtab" id="subtab-settings-appearance" type="button">
+                    <svg class="icon" aria-hidden="true"><use href="#i-palette"/></svg><span data-i18n="settings.appearance">Оформление</span>
+                </button>
+                <button class="subnavtab" id="subtab-settings-security" type="button">
+                    <svg class="icon" aria-hidden="true"><use href="#i-shield"/></svg><span data-i18n="settings.security">Безопасность</span>
+                </button>
+            </nav>
+
+            <section id="settings-updates" class="admin-section">
+                <h2 class="section-title"><svg class="icon" aria-hidden="true"><use href="#i-globe"/></svg><span data-i18n="settings.priorityTitle">Приоритет источников обновлений</span></h2>
+                <p class="muted small settings-hint" data-i18n="settings.priorityHint">
+                    Проверка идёт сверху вниз: мод ищется на первом источнике; если его там нет (проект удалён, источник недоступен или у мода нет метаданных), установленный файл ищется по хэшу на следующем. Найденный на приоритетном источнике файл перепривязывает мод к нему.
+                </p>
+                <div id="prio-list" class="prio-list"></div>
+
+                <h2 class="section-title" style="margin-top:26px"><svg class="icon" aria-hidden="true"><use href="#i-zap"/></svg><span data-i18n="settings.behaviorTitle">Поведение модпака</span></h2>
+                <div class="settings-form">
+                    <label class="set-row">
+                        <span class="set-label"><span data-i18n="settings.autoRehash">Автопересчёт хэшей после изменений</span><span class="muted small set-sub" data-i18n="settings.autoRehashHint">клиенты увидят изменения при следующем запуске</span></span>
+                        <input type="checkbox" class="toggle" id="set-autoRehash">
+                    </label>
+                    <label class="set-row">
+                        <span class="set-label"><span data-i18n="settings.verifyHash">Проверять SHA-хэш после скачивания</span><span class="muted small set-sub" data-i18n="settings.verifyHashHint">файл не совпал с хэшем источника — загрузка отклоняется</span></span>
+                        <input type="checkbox" class="toggle" id="set-verifyHash">
+                    </label>
+                    <label class="set-row">
+                        <span class="set-label"><span data-i18n="settings.allowWithoutHash">Разрешать загрузку без хэша</span><span class="muted small set-sub" data-i18n="settings.allowWithoutHashHint">если источник не дал хэш файла</span></span>
+                        <input type="checkbox" class="toggle" id="set-allowWithoutHash">
+                    </label>
+                    <label class="set-row">
+                        <span class="set-label"><span data-i18n="settings.autoResolveDeps">Автоматически подтягивать зависимости и конфликты</span><span class="muted small set-sub" data-i18n="settings.autoResolveDepsHint">при добавлении мода — по данным последней версии</span></span>
+                        <input type="checkbox" class="toggle" id="set-autoResolveDeps">
+                    </label>
+                    <label class="set-row">
+                        <span class="set-label"><span data-i18n="settings.syncProfileOptional">Синхронизировать опциональные с updateOptional профиля</span><span class="muted small set-sub" data-i18n="settings.syncProfileOptionalHint">игроки увидят опциональные моды в «Настройках» лаунчера</span></span>
+                        <input type="checkbox" class="toggle" id="set-syncProfileOptional">
+                    </label>
+                    <label class="set-row">
+                        <span class="set-label"><span data-i18n="settings.defaultOptionalEnabled">Опциональные моды включены по умолчанию</span><span class="muted small set-sub" data-i18n="settings.defaultOptionalEnabledHint">состояние новых опциональных модов при добавлении/импорте</span></span>
+                        <input type="checkbox" class="toggle" id="set-defaultOptionalEnabled">
+                    </label>
+                    <div class="set-row two-inputs">
+                        <label class="set-field">
+                            <span class="set-label" data-i18n="settings.defaultChannel">Канал обновлений по умолчанию</span>
+                            <select id="set-defaultChannel" class="input select">
+                                <option value="release">release</option>
+                                <option value="beta">beta</option>
+                                <option value="alpha">alpha</option>
+                            </select>
+                        </label>
+                        <label class="set-field">
+                            <span class="set-label" data-i18n="settings.cacheTtl">Кэш ответов API, минут</span>
+                            <input type="number" id="set-cacheTtlMinutes" class="input" min="1" max="1440" step="1">
+                        </label>
+                    </div>
+                    <label class="set-row">
+                        <span class="set-label"><span data-i18n="settings.siteDomains">Домены сайта (адрес в корне)</span>
+                            <span class="muted small set-sub" data-i18n="settings.siteDomainsHint">по одному в строке или через запятую: сайт откроется и как ip:порт/mods/, и в корне этих доменов (например mods.example.com); применяется сразу</span></span>
+                        <textarea id="set-siteDomains" class="input ignore-box" rows="3" spellcheck="false" placeholder="mods.example.com"></textarea>
+                    </label>
+                </div>
+
+                <h2 class="section-title" style="margin-top:26px"><svg class="icon" aria-hidden="true"><use href="#i-x"/></svg><span data-i18n="settings.ignoreTitle">Игнорируемые файлы по категориям</span></h2>
+                <p class="muted small settings-hint" data-i18n="settings.ignoreHint">
+                    Шаблоны как в .gitignore — по одному на строку. Подходящие файлы и папки модуль не трогает: не показывает «лишними», не импортирует и не тратит на них запросы к Modrinth/CurseForge. Например: .index (папка Sinytra Connector), *.tmp, cache/, !keep.jar — исключение из игнора. # — комментарий.
+                </p>
+                <div class="settings-form">
+                    <div class="set-row two-inputs">
+                        <label class="set-field">
+                            <span class="set-label" data-i18n="settings.ignoreMods">Моды (папка mods)</span>
+                            <textarea id="set-ignoreMods" class="input ignore-box" rows="4" spellcheck="false" placeholder=".index&#10;cache/&#10;!keep-this.jar"></textarea>
+                        </label>
+                        <label class="set-field">
+                            <span class="set-label" data-i18n="settings.ignoreResourcepacks">Ресурспаки (папка resourcepacks)</span>
+                            <textarea id="set-ignoreResourcepacks" class="input ignore-box" rows="4" spellcheck="false"></textarea>
+                        </label>
+                    </div>
+                    <div class="set-row two-inputs">
+                        <label class="set-field">
+                            <span class="set-label" data-i18n="settings.ignoreShaders">Шейдеры (папка shaderpacks)</span>
+                            <textarea id="set-ignoreShaders" class="input ignore-box" rows="4" spellcheck="false"></textarea>
+                        </label>
+                    </div>
+                </div>
+
+                <h2 class="section-title" style="margin-top:26px"><svg class="icon" aria-hidden="true"><use href="#i-send"/></svg><span data-i18n="settings.suggestTitle">Предложения и поиск</span></h2>
+                <div class="settings-form">
+                    <div class="set-row two-inputs">
+                        <label class="set-field">
+                            <span class="set-label" data-i18n="settings.defaultType">Искать по умолчанию</span>
+                            <select id="set-defaultType" class="input select">
+                                <option value="mod" data-i18n="kind.mod">Моды</option>
+                                <option value="resourcepack" data-i18n="kind.resourcepack">Ресурспаки</option>
+                                <option value="shader" data-i18n="kind.shader">Шейдеры</option>
+                            </select>
+                        </label>
+                        <label class="set-field">
+                            <span class="set-label" data-i18n="settings.suggestLimit">Лимит предложений на пользователя</span>
+                            <input type="number" id="set-suggestLimit" class="input" min="0" max="100" step="1">
+                        </label>
+                    </div>
+                    <label class="set-row">
+                        <span class="set-label"><span data-i18n="settings.suggestEnabled">Разрешить предлагать моды</span><span class="muted small set-sub" data-i18n="settings.suggestEnabledHint">наблюдатель предлагает проект из поиска, админ скачивает или отклоняет</span></span>
+                        <input type="checkbox" class="toggle" id="set-suggestEnabled">
+                    </label>
+                    <div class="set-row suggest-ban-row">
+                        <span class="set-label"><span data-i18n="settings.suggestBanned">Без права предлагать</span><span class="muted small set-sub" data-i18n="settings.suggestBannedHint">логины, которым кнопка «Предложить» недоступна</span></span>
+                        <div class="ban-add">
+                            <input type="text" id="suggest-ban-input" class="input" maxlength="64" data-i18n-placeholder="settings.suggestBanLogin" placeholder="логин">
+                            <button class="btn danger" id="suggest-ban-add" type="button">
+                                <svg class="icon" aria-hidden="true"><use href="#i-plus"/></svg><span data-i18n="admin.add">Добавить</span>
+                            </button>
+                        </div>
+                    </div>
+                    <ul id="suggest-bans" class="iplist suggest-bans"></ul>
+                </div>
+                <h2 class="section-title" style="margin-top:26px"><svg class="icon" aria-hidden="true"><use href="#i-info"/></svg><span data-i18n="settings.consoleTitle">Вывод в консоль сервера</span></h2>
+                <div class="settings-form">
+                    <div class="set-row two-inputs">
+                        <label class="set-field">
+                            <span class="set-label" data-i18n="settings.consoleLevel">Уровень логов модуля</span>
+                            <select id="set-consoleLevel" class="input select">
+                                <option value="off" data-i18n="console.off">Ничего</option>
+                                <option value="error" data-i18n="console.error">Только ошибки</option>
+                                <option value="warn" data-i18n="console.warn">Ошибки и предупреждения</option>
+                                <option value="all" data-i18n="console.all">Всё (info/debug)</option>
+                            </select>
+                        </label>
+                    </div>
+                    <p class="muted small settings-hint" data-i18n="settings.consoleHint">off — модуль молчит полностью; error — только ошибки; warn — ошибки и предупреждения (по умолчанию); all — весь вывод, включая отладку синхронизации. Применяется сразу и не влияет на файл аудита.</p>
+                </div>
+                <div class="toolbar" style="padding-top:16px">
+                    <button class="btn primary" id="btn-settings-save" type="button">
+                        <svg class="icon" aria-hidden="true"><use href="#i-check"/></svg><span data-i18n="settings.save">Сохранить настройки</span>
+                    </button>
+                </div>
+            </section>
+
+            <section id="settings-appearance" class="admin-section hidden">
+                <h2 class="section-title"><svg class="icon" aria-hidden="true"><use href="#i-palette"/></svg><span data-i18n="settings.themesTitle">Темы оформления сайта</span></h2>
+                <p class="muted small settings-hint" data-i18n="settings.themesHint">
+                    У каждой темы — светлый и тёмный вариант: игроки, наблюдатели и админы выбирают подходящий в меню «Тема» в топбаре; выбор сохраняется в браузере. Тема и вариант по умолчанию — для тех, кто ещё ничего не выбрал.
+                </p>
+                <div class="settings-form">
+                    <div class="set-row two-inputs">
+                        <label class="set-field">
+                            <span class="set-label" data-i18n="settings.themesDefault">Тема по умолчанию</span>
+                            <select id="set-themeDefault" class="input select"></select>
+                        </label>
+                        <label class="set-field">
+                            <span class="set-label" data-i18n="settings.themesMode">Вариант по умолчанию</span>
+                            <select id="set-themeMode" class="input select">
+                                <option value="light" data-i18n="theme.light">Светлый</option>
+                                <option value="dark" data-i18n="theme.dark">Тёмный</option>
+                            </select>
+                        </label>
+                    </div>
+
+                    <h3 class="theme-mode-sub"><svg class="icon" aria-hidden="true"><use href="#i-layers"/></svg><span data-i18n="settings.themesBuiltin">Встроенные темы</span></h3>
+                    <p class="muted small settings-hint" data-i18n="settings.themesBuiltinHint">Выключенная тема скрыта у всех: у игроков, наблюдателей и администраторов. Выключить можно любую, но хотя бы одна должна остаться (или добавьте свою).</p>
+                    <div id="theme-builtin-list" class="theme-admin-list"></div>
+
+                    <h3 class="theme-mode-sub"><svg class="icon" aria-hidden="true"><use href="#i-sparkles"/></svg><span data-i18n="settings.themesCustom">Свои темы</span></h3>
+                    <p class="muted small settings-hint" data-i18n="settings.themesCustomHint">Своя тема — название, шрифт, углы и по семь цветов на светлый и тёмный вариант; остальные тона сайт выводит сам. Доступна всем так же, как встроенные. Максимум — 16.</p>
+                    <div id="theme-custom-list" class="theme-admin-list"></div>
+                    <div class="toolbar">
+                        <button class="btn" id="btn-theme-add" type="button">
+                            <svg class="icon" aria-hidden="true"><use href="#i-plus"/></svg><span data-i18n="themes.add">Добавить тему</span>
+                        </button>
+                    </div>
+                </div>
+                <div class="toolbar" style="padding-top:16px">
+                    <button class="btn primary" id="btn-settings2-save" type="button">
+                        <svg class="icon" aria-hidden="true"><use href="#i-check"/></svg><span data-i18n="settings.save">Сохранить настройки</span>
+                    </button>
+                </div>
+            </section>
+
+            <section id="settings-security" class="admin-section hidden">
+                <nav class="subnav">
+                    <button class="subnavtab active" id="subtab-bans" type="button">
+                        <svg class="icon" aria-hidden="true"><use href="#i-ban"/></svg><span data-i18n="admin.bans">Баны</span>
+                    </button>
+                    <button class="subnavtab" id="subtab-ipfilter" type="button">
+                        <svg class="icon" aria-hidden="true"><use href="#i-filter"/></svg><span data-i18n="admin.ipfilter">IP-фильтр</span>
+                    </button>
+                    <button class="subnavtab" id="subtab-audit" type="button">
+                        <svg class="icon" aria-hidden="true"><use href="#i-file"/></svg><span data-i18n="admin.audit">Аудит</span>
+                    </button>
+                    <button class="subnavtab" id="subtab-users" type="button">
+                        <svg class="icon" aria-hidden="true"><use href="#i-users"/></svg><span data-i18n="admin.users">Аккаунты</span>
+                    </button>
+                </nav>
+
+            <section id="admin-bans" class="admin-section">
+                <h2 class="section-title"><svg class="icon" aria-hidden="true"><use href="#i-ban"/></svg><span data-i18n="admin.bansTitle">Активные баны IP</span></h2>
+                <div class="table-wrap">
+                    <table class="table" id="table-bans">
+                        <thead>
+                        <tr>
+                            <th data-i18n="admin.ip">IP</th>
+                            <th data-i18n="admin.until">До</th>
+                            <th data-i18n="admin.level">Уровень</th>
+                            <th data-i18n="admin.fails">Ошибок</th>
+                            <th></th>
+                        </tr>
+                        </thead>
+                        <tbody></tbody>
+                    </table>
+                </div>
+                <h2 class="section-title"><svg class="icon" aria-hidden="true"><use href="#i-user"/></svg><span data-i18n="admin.locksTitle">Блокировки логинов</span></h2>
+                <div class="table-wrap">
+                    <table class="table" id="table-locks">
+                        <thead>
+                        <tr>
+                            <th data-i18n="admin.login">Логин</th>
+                            <th data-i18n="admin.until">До</th>
+                            <th data-i18n="admin.level">Уровень</th>
+                            <th></th>
+                        </tr>
+                        </thead>
+                        <tbody></tbody>
+                    </table>
+                </div>
+            </section>
+
+            <section id="admin-ipfilter" class="admin-section hidden">
+                <div class="ipfilter-grid">
+                    <div class="ipfilter-card card-ok">
+                        <h2 class="section-title"><svg class="icon" aria-hidden="true"><use href="#i-shield"/></svg><span data-i18n="admin.whitelist">Белый список (никогда не блокируются)</span></h2>
+                        <ul id="list-whitelist" class="iplist"></ul>
+                        <div class="ipadd">
+                            <span class="input-wrap">
+                                <input type="text" id="wl-input" class="input" placeholder="192.168.1.10 / 10.0.0.0/24" maxlength="50">
+                            </span>
+                            <button class="btn" id="wl-add" type="button">
+                                <svg class="icon" aria-hidden="true"><use href="#i-plus"/></svg><span data-i18n="admin.add">Добавить</span>
+                            </button>
+                        </div>
+                    </div>
+                    <div class="ipfilter-card card-danger">
+                        <h2 class="section-title"><svg class="icon" aria-hidden="true"><use href="#i-shield-x"/></svg><span data-i18n="admin.blacklist">Чёрный список (доступ запрещён)</span></h2>
+                        <ul id="list-blacklist" class="iplist"></ul>
+                        <div class="ipadd">
+                            <span class="input-wrap">
+                                <input type="text" id="bl-input" class="input" placeholder="1.2.3.4 / 5.6.7.0/24" maxlength="50">
+                            </span>
+                            <button class="btn danger" id="bl-add" type="button">
+                                <svg class="icon" aria-hidden="true"><use href="#i-plus"/></svg><span data-i18n="admin.add">Добавить</span>
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <section id="admin-audit" class="admin-section hidden">
+                <div class="toolbar">
+                    <button class="btn" id="btn-audit-refresh" type="button">
+                        <svg class="icon" aria-hidden="true"><use href="#i-refresh"/></svg><span data-i18n="admin.refresh">Обновить</span>
+                    </button>
+                    <button class="btn" id="btn-audit-newer" type="button" aria-label="Newer">
+                        <svg class="icon" aria-hidden="true"><use href="#i-chevron-l"/></svg><span data-i18n="admin.newer">Новее</span>
+                    </button>
+                    <button class="btn" id="btn-audit-older" type="button" aria-label="Older">
+                        <svg class="icon" aria-hidden="true"><use href="#i-chevron-r"/></svg><span data-i18n="admin.older">Старее</span>
+                    </button>
+                </div>
+                <pre id="audit-log" class="audit-log"></pre>
+            </section>
+
+            <section id="admin-users" class="admin-section hidden">
+                <h2 class="section-title"><svg class="icon" aria-hidden="true"><use href="#i-users"/></svg><span data-i18n="admin.usersTitle">Локальные аккаунты сайта</span></h2>
+                <div class="table-wrap">
+                    <table class="table" id="table-users">
+                        <thead>
+                        <tr>
+                            <th data-i18n="admin.login">Логин</th>
+                            <th data-i18n="admin.role">Роль</th>
+                            <th data-i18n="admin.totp">2FA</th>
+                            <th data-i18n="admin.enabled">Включён</th>
+                            <th data-i18n="admin.newPassword">Новый пароль</th>
+                        </tr>
+                        </thead>
+                        <tbody></tbody>
+                    </table>
+                </div>
+                <p class="muted small users-hint" data-i18n="admin.usersHint">
+                    Аккаунты задаются в конфиге модуля или командой «mods user add …» консоли LaunchServer.
+                    Учётные записи лаунчера управляются самим лаунчером.
+                </p>
+            </section>
+            </section>
+        </main>
+        </div>
+    </div>
+</div>
+
+<div id="toast-container" class="toast-container" role="status" aria-live="polite"></div>
+<div id="modal-root"></div>
+
+<script src="i18n.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
