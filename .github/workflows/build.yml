@@ -1,0 +1,163 @@
+name: Build & Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Тег релиза, напр. v1.1.0 (пусто = только сборка без релиза)'
+        required: false
+        default: 'v1.1.0'
+      ls_release:
+        description: 'Тег релиза LaunchServer (latest = последний релиз GravitLauncher)'
+        required: false
+        default: 'latest'
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ModsSite_module
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          validate-wrappers: true
+
+      # Все входы передаются в shell ТОЛЬКО через env — защита от script injection.
+      - name: Resolve LaunchServer release
+        id: ls
+        env:
+          LS_RELEASE: ${{ inputs.ls_release || 'latest' }}
+        run: |
+          if [ "$LS_RELEASE" = "latest" ]; then
+            TAG=$(curl -sI -o /dev/null -w '%{url_effective}' -L \
+              https://github.com/GravitLauncher/Launcher/releases/latest | sed 's#.*/tag/##')
+            if [ -z "$TAG" ]; then
+              echo "::error::Не удалось определить последний релиз GravitLauncher"
+              exit 1
+            fi
+          else
+            TAG="$LS_RELEASE"
+          fi
+          echo "LaunchServer release: $TAG"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Restore LaunchServer cache
+        id: ls_cache
+        uses: actions/cache@v4
+        with:
+          path: launchserver
+          key: launchserver-${{ steps.ls.outputs.tag }}
+
+      - name: Download LaunchServer
+        if: ${{ steps.ls_cache.outputs.cache-hit != 'true' }}
+        run: |
+          set -e
+          curl -sSL --retry 3 -o "$RUNNER_TEMP/LaunchServerBuild.zip" \
+            "https://github.com/GravitLauncher/Launcher/releases/download/${{ steps.ls.outputs.tag }}/LaunchServerBuild.zip"
+          unzip -q "$RUNNER_TEMP/LaunchServerBuild.zip" -d launchserver
+          rm -f "$RUNNER_TEMP/LaunchServerBuild.zip"
+
+      - name: Check LaunchServer layout
+        run: |
+          test -d launchserver/lib || {
+            echo "::error::В LaunchServerBuild.zip нет каталога lib/ — модуль собирается против lib/*.jar"
+            exit 1
+          }
+          echo "lib jars: $(ls launchserver/lib/*.jar | wc -l)"
+
+      - name: Build
+        run: ./gradlew --no-daemon build -PlaunchserverDir="$PWD/launchserver"
+
+      # Что именно упаковано в jar — печатаем в лог и проверяем ключевые вещи.
+      - name: Verify jar
+        run: |
+          set -e
+          JAR=build/libs/ModsSite_module.jar
+          test -f "$JAR" || { echo "::error::build/libs/ModsSite_module.jar не собрался"; exit 1; }
+          unzip -l "$JAR" | grep -q "pro/gravit/launchermodules/modssite/ModsSiteModule.class" \
+            || { echo "::error::в jar нет главного класса модуля"; exit 1; }
+          unzip -p "$JAR" META-INF/MANIFEST.MF | tr -d '\r' | grep -q \
+            "Module-Main-Class: pro.gravit.launchermodules.modssite.ModsSiteModule" \
+            || { echo "::error::в манифесте нет Module-Main-Class"; exit 1; }
+          # Разбор ответа CurseForge: в классе должен быть путь pagination.totalCount
+          unzip -p "$JAR" \
+            "pro/gravit/launchermodules/modssite/mods/CurseForgeApiProvider*.class" | \
+            grep -qa "totalCount" || { echo "::error::в jar нет totalCount (старый код?)"; exit 1; }
+          echo "Classes in jar: $(unzip -l "$JAR" | grep -c '\.class')"
+          sha256sum "$JAR"
+
+      # Релиз по кнопке: тег должен совпадать с версией модуля (v1.1.0 <-> 1.1.0).
+      - name: Check release tag matches module version
+        if: ${{ inputs.release_tag != '' || startsWith(github.ref, 'refs/tags/') }}
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+        run: |
+          set -e
+          VER=$(grep -oP 'version\s*=\s*"\K[^"]+' build.gradle.kts)
+          echo "Модуль: $VER, тег релиза: $RELEASE_TAG"
+          if [ "$RELEASE_TAG" != "v$VER" ]; then
+            echo "::error::Тег '$RELEASE_TAG' не совпадает с версией модуля '$VER' (ожидался v$VER). Сначала поднимите version в build.gradle.kts."
+            exit 1
+          fi
+
+      - name: Pack distribution zip (sources + jar)
+        run: |
+          set -e
+          VER=$(grep -oP 'version\s*=\s*"\K[^"]+' build.gradle.kts)
+          ZIP="ModsSite_module-${VER}.zip"
+          git archive --format=zip -o "$ZIP" HEAD
+          mkdir -p "$RUNNER_TEMP/zipadd"
+          cp build/libs/ModsSite_module.jar "$RUNNER_TEMP/zipadd/"
+          (cd "$RUNNER_TEMP/zipadd" && zip -q "$OLDPWD/$ZIP" ModsSite_module.jar)
+          echo "ZIP=$ZIP" >> "$GITHUB_ENV"
+          unzip -l "$ZIP" | tail -5
+
+      # Тег для релиза по кнопке создаём сами, только если его ещё нет.
+      - name: Create release tag (button-triggered)
+        if: ${{ inputs.release_tag != '' }}
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -e
+          if git ls-remote --exit-code --tags origin "refs/tags/$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Тег $RELEASE_TAG уже существует — релиз будет привязан к нему"
+          else
+            git config user.name  "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag "$RELEASE_TAG" "${{ github.sha }}"
+            git push origin "refs/tags/$RELEASE_TAG"
+          fi
+
+      - name: Publish GitHub Release
+        if: ${{ inputs.release_tag != '' || startsWith(github.ref, 'refs/tags/') }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag || github.ref_name }}
+          name: ModsSite ${{ inputs.release_tag || github.ref_name }}
+          files: |
+            build/libs/ModsSite_module.jar
+            ${{ env.ZIP }}
+          generate_release_notes: true
+
+      - name: Upload artifact (always)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ModsSite_module
+          path: |
+            build/libs/ModsSite_module.jar
+            ${{ env.ZIP }}
+          if-no-files-found: error
