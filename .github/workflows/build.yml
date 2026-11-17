@@ -1,14 +1,30 @@
+# ModsSite: сборка модуля и публикация релизов.
+#
+# Как пользоваться:
+#   1) Кнопка: вкладка Actions -> "Build & Release" -> "Run workflow".
+#      - release_tag заполнен -> сборка + GitHub Release (jar + zip), тег
+#        создаётся автоматически, если его ещё нет;
+#      - release_tag очищен   -> только сборка, jar появится в Artifacts.
+#   2) Автозапуск: пуш тега v* делает то же самое без кнопки.
+#
+# Откуда CI берёт jar'ы самого LaunchServer (Gravit):
+#   LaunchServerBuild.zip скачивается из релиза GravitLauncher
+#   (репозиторий GravitLauncher/Launcher, тег задаётся входом ls_release,
+#   по умолчанию последний релиз) и распаковывается в ./launchserver;
+#   модуль собирается против его lib/*.jar — ровно как в README.
+# Архив кэшируется по тегу релиза, чтобы не качать 55 МБ каждый раз.
+
 name: Build & Release
 
 on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: 'Тег релиза, напр. v1.1.0 (пусто = только сборка без релиза)'
+        description: 'Тег релиза (пустое поле - только сборка без релиза)'
         required: false
-        default: 'v1.1.0'
+        default: ''
       ls_release:
-        description: 'Тег релиза LaunchServer (latest = последний релиз GravitLauncher)'
+        description: 'Тег релиза LaunchServer (latest - последний релиз GravitLauncher)'
         required: false
         default: 'latest'
   push:
@@ -80,7 +96,9 @@ jobs:
           echo "lib jars: $(ls launchserver/lib/*.jar | wc -l)"
 
       - name: Build
-        run: ./gradlew --no-daemon build -PlaunchserverDir="$PWD/launchserver"
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon build -PlaunchserverDir="$PWD/launchserver"
 
       # Что именно упаковано в jar — печатаем в лог и проверяем ключевые вещи.
       - name: Verify jar
@@ -102,7 +120,7 @@ jobs:
 
       # Релиз по кнопке: тег должен совпадать с версией модуля (v1.1.0 <-> 1.1.0).
       - name: Check release tag matches module version
-        if: ${{ inputs.release_tag != '' || startsWith(github.ref, 'refs/tags/') }}
+        if: ${{ inputs.release_tag || github.ref_type == 'tag' }}
         env:
           RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
         run: |
@@ -128,7 +146,7 @@ jobs:
 
       # Тег для релиза по кнопке создаём сами, только если его ещё нет.
       - name: Create release tag (button-triggered)
-        if: ${{ inputs.release_tag != '' }}
+        if: ${{ inputs.release_tag }}
         env:
           RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
@@ -143,7 +161,7 @@ jobs:
           fi
 
       - name: Publish GitHub Release
-        if: ${{ inputs.release_tag != '' || startsWith(github.ref, 'refs/tags/') }}
+        if: ${{ inputs.release_tag || github.ref_type == 'tag' }}
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.release_tag || github.ref_name }}
