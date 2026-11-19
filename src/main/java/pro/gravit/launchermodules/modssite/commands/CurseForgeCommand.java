@@ -156,13 +156,22 @@ public class CurseForgeCommand extends Command {
          */
         private static void searchProbe(org.apache.logging.log4j.Logger logger, HttpClient client,
                                         String baseUrl, String apiKey, String gameVersion) {
+            // Версия не передана/пустая — берём ходовую, чтобы пробы с фильтром
+            // версии были осмысленными (пустой gameVersion давал бы мусор в URL).
+            String version = gameVersion == null || gameVersion.isBlank() ? "1.20.1" : gameVersion.trim();
+            String encodedVersion;
+            try {
+                encodedVersion = java.net.URLEncoder.encode(version, java.nio.charset.StandardCharsets.UTF_8);
+            } catch (Exception e) {
+                encodedVersion = "1.20.1";
+            }
             String base = baseUrl + "/v1/mods/search?gameId=432&classId=6&pageSize=1&searchFilter=";
             String[][] cases = {
                     {"Forge, БЕЗ версии игры (так было до 1.0.10)", "&modLoaderType=1"},
-                    {"Forge + версия " + gameVersion, "&modLoaderType=1&gameVersion=" + gameVersion},
-                    {"Fabric + версия " + gameVersion, "&modLoaderType=4&gameVersion=" + gameVersion},
-                    {"NeoForge + версия " + gameVersion, "&modLoaderType=6&gameVersion=" + gameVersion},
-                    {"Без загрузчика + версия " + gameVersion, "&gameVersion=" + gameVersion},
+                    {"Forge + версия " + version, "&modLoaderType=1&gameVersion=" + encodedVersion},
+                    {"Fabric + версия " + version, "&modLoaderType=4&gameVersion=" + encodedVersion},
+                    {"NeoForge + версия " + version, "&modLoaderType=6&gameVersion=" + encodedVersion},
+                    {"Без загрузчика + версия " + version, "&gameVersion=" + encodedVersion},
             };
             logger.info("Проба поиска (влияние фильтра загрузчика; своя версия — mods curseforge test <версия>):");
             for (int i = 0; i < cases.length; i++) {
@@ -174,6 +183,7 @@ public class CurseForgeCommand extends Command {
                 try {
                     HttpResponse<String> response = client.send(probe, HttpResponse.BodyHandlers.ofString());
                     long total = -1;
+                    String parseNote = null;
                     if (response.statusCode() / 100 == 2) {
                         try {
                             com.google.gson.JsonObject parsed = com.google.gson.JsonParser
@@ -185,12 +195,21 @@ public class CurseForgeCommand extends Command {
                                     total = pagination.get("totalCount").getAsLong();
                                 } else if (pagination.has("total") && !pagination.get("total").isJsonNull()) {
                                     total = pagination.get("total").getAsLong();
+                                } else {
+                                    // Раньше здесь молчало «всего: ?» без причины —
+                                    // теперь печатаем фактическую pagination целиком
+                                    parseNote = "в pagination нет totalCount/total: " + pagination;
                                 }
+                            } else {
+                                parseNote = "в ответе нет объекта pagination";
                             }
-                        } catch (RuntimeException ignored) {
+                        } catch (RuntimeException e) {
+                            parseNote = "ответ не JSON/не объект (" + e.getClass().getSimpleName() + "): "
+                                    + snippet(response.body());
                         }
-                        logger.info("  [{}] {} -> HTTP {}, всего: {}", i + 1, cases[i][0], response.statusCode(),
-                                total < 0 ? "?" : total);
+                        logger.info("  [{}] {} -> HTTP {}, всего: {}{}", i + 1, cases[i][0], response.statusCode(),
+                                total < 0 ? "?" : total,
+                                parseNote == null ? "" : " — " + parseNote);
                     } else {
                         logger.info("  [{}] {} -> HTTP {}{}", i + 1, cases[i][0], response.statusCode(),
                                 snippet(response.body()));

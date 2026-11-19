@@ -81,6 +81,17 @@ public abstract class ModsApiProvider {
     /** Пакетное получение информации о проектах. */
     public abstract Map<String, ProjectInfo> projects(List<String> projectIds) throws Exception;
 
+    /**
+     * Точная версия файла по её ID (Modrinth version id / CurseForge file id).
+     * Нужна для восстановления бекапов: качаем ровно тот файл, что был
+     * записан в манифесте бекапа, а не «последнюю подходящую».
+     *
+     * @return версия или null, если источник недоступен/версия не найдена
+     */
+    public RemoteVersionInfo versionById(String versionId) throws Exception {
+        return null;
+    }
+
     /** Максимальный размер кэша ответов (защита от роста при произвольных поисковых запросах). */
     private static final int CACHE_MAX_ENTRIES = 256;
 

@@ -21,6 +21,11 @@ const S = {
     modsFilter: loadModsFilter(),
     settings: null,       // ответ /api/settings (вкладка «Настройки»)
     suggestBansLocal: [], // рабочий список банов предложения (до «Сохранить»)
+    backups: null,        // ответ /api/backups (вкладка «Бекапы»)
+    backupsTimer: null,   // опрос активной задачи бекапа
+    backupsJobSeen: false, // задача была видна — покажем тост по завершении
+    backupsFoldersDirty: false, // админ меняет галочки — не затирать при перерисовке
+    updateJob: null,      // фоновая задача обновления/применения (прогресс)
 };
 
 /** Фильтры списка модов из localStorage (с защитой от мусора).
@@ -273,10 +278,12 @@ async function boot() {
     $("topbar-title").textContent = session.data.title || "Mods Manager";
     document.title = session.data.title || "Mods Manager";
     $("topbar-version").textContent = "v" + (session.data.version || "");
-    const isAdmin = session.data.role === "admin";
+    const isAdmin = session.data.role === "admin" || session.data.role === "superadmin";
+    const roleLabel = session.data.role || "viewer";
     $("user-badge").innerHTML = icon("user") + "<span>" + esc(session.data.login) + "</span>" +
-        '<span class="role-chip' + (isAdmin ? "" : " viewer") + '">' + (isAdmin ? "admin" : "viewer") + "</span>";
+        '<span class="role-chip' + (isAdmin ? (session.data.role === "superadmin" ? " super" : "") : " viewer") + '">' + esc(roleLabel) + "</span>";
     $("tab-settings").classList.toggle("hidden", !isAdmin);
+    $("tab-backups").classList.toggle("hidden", !isAdmin);
     $("tab-suggest").classList.toggle("hidden", !isAdmin);
     // Админские кнопки: наблюдателю скрываем (display:none), админу — показываем.
     // Кнопки НЕ удаляются из DOM: смена сессии наблюдатель→админ в той же
@@ -285,6 +292,10 @@ async function boot() {
     // профиль», «Применить состав»; чип «авто-хэш» тоже не показываем
     ["btn-check", "btn-update-all", "btn-rehash", "btn-reload-profile", "btn-apply"]
         .forEach(id => { const el = $(id); if (el) el.classList.toggle("hidden", !isAdmin); });
+    // Вкладка «Роли админов» в панели Безопасность — только суперадмину
+    // (логины суперадминов задаются вручную в config.superAdmins)
+    const rolesTab = $("subtab-roles");
+    if (rolesTab) rolesTab.classList.toggle("hidden", session.data.role !== "superadmin");
     // Тип поиска по умолчанию: персональный выбор браузера → настройка сервера → моды
     S.search.type = ["mod", "resourcepack", "shader"].includes(localStorage.getItem("mods_ptype"))
         ? localStorage.getItem("mods_ptype")
@@ -319,7 +330,7 @@ async function boot() {
 
 /** Обновить счётчик предложений на вкладке (админ). */
 async function refreshSuggestBadge() {
-    if (!S.session || S.session.role !== "admin") return;
+    if (!isAdmin()) return;
     const result = await api("mods/suggestions");
     if (!result.ok) return;
     S.suggestQueue.pendingTotal = result.data.pendingTotal || 0;
@@ -349,6 +360,7 @@ async function selectFirstProfile() {
 async function selectProfile(dir) {
     S.currentProfile = dir;
     S.modsFilter.query = ""; // поиск по установленным — заново на каждый профиль
+    S.backupsFoldersDirty = false; // выбор папок бекапа — заново на каждый профиль
     const searchInput = $("mod-search");
     if (searchInput) searchInput.value = "";
     await loadPack();
@@ -382,16 +394,27 @@ function renderProfiles() {
 /* ================= Модпак ================= */
 let orphanShowAll = false; // блок «лишних файлов» показан целиком (кнопка «Показать все»)
 
-async function loadPack() {
+async function loadPack(retry) {
     if (!S.currentProfile) return;
     const result = await api("mods?profile=" + encodeURIComponent(S.currentProfile));
     if (!result.ok) {
+        // На всякий случай оставляем тихий ретрай (сервер теперь во время
+        // обновления отдаёт список без 409) — в запасных сценариях сети
+        if (result.error && result.error.code === "update_in_progress" && (retry || 0) < 300) {
+            setTimeout(() => loadPack((retry || 0) + 1), 2000);
+            return;
+        }
         toast(result.error ? result.error.message : t("common.error"), "error");
         return;
     }
     S.pack = result.data;
     orphanShowAll = false;
     renderPack();
+    // Обновление уже идёт (например, страница перезагружена посреди задачи) —
+    // сервер прислал снимок задачи: сразу открываем окно статуса
+    if (result.data.job && !result.data.job.finished) {
+        restoreUpdateJob(result.data.job);
+    }
 }
 
 function modById(id) {
@@ -483,7 +506,7 @@ function renderPack() {
     const grid = $("mods-grid");
     const empty = $("mods-empty");
     updateFilterBar();
-    const isAdmin = S.session && S.session.role === "admin";
+    const isAdmin = S.session && (S.session.role === "admin" || S.session.role === "superadmin");
     if (!S.pack) {
         grid.innerHTML = "";
         empty.innerHTML = icon("inbox", "empty-icon") + "<p>" + esc(t("mods.selectProfile")) + "</p>";
@@ -685,11 +708,16 @@ function renderModCard(mod, byId, conflictIds, isAdmin) {
     // действия
     const actions = [];
     if (isAdmin) {
-        if (mod.source !== "local" && (mod.hasUpdate || !inst.version)) {
+        // «Скачать заново»: версия установлена, но файла нет на диске (пострадал
+        // от обновления на старой версии, ручной чистки и т.п.) — кнопка видна
+        // даже если обновлений нет, сервер доставит актуальную версию.
+        const fileMissing = inst.version && !inst.fileExists;
+        if (mod.source !== "local" && (mod.hasUpdate || !inst.version || fileMissing)) {
             const upBtn = document.createElement("button");
             upBtn.type = "button";
-            upBtn.className = "btn small";
-            upBtn.innerHTML = icon("refresh") + "<span>" + esc(t("mods.update")) + "</span>";
+            upBtn.className = "btn small" + (fileMissing ? " primary" : "");
+            upBtn.innerHTML = icon("refresh") + "<span>"
+                + esc(t(fileMissing ? "mods.reinstall" : "mods.update")) + "</span>";
             upBtn.addEventListener("click", () => updateMods([mod.id], upBtn));
             actions.push(upBtn);
         }
@@ -800,6 +828,9 @@ async function checkUpdates() {
         showSourceWarnings(result.data.warnings);
         await loadProfiles();
         await loadPack();
+    } else if (result.error && result.error.code === "update_in_progress") {
+        // пока идёт обновление, проверка невозможна — откроем окно статуса
+        openUpdateProgress("update");
     } else {
         toast(result.error ? result.error.message : t("common.error"), "error");
     }
@@ -845,34 +876,229 @@ async function reloadProfile() {
 }
 
 async function updateMods(ids, busyBtn) {
+    let body = { profile: S.currentProfile };
     if (ids === null || ids === undefined) {
-        const updatable = (S.pack.mods || []).filter(m => m.hasUpdate).length;
-        if (!updatable) {
+        // «Обновить всё»: обновляем ТОЛЬКО то, что нашла проверка обновлений
+        // (hasUpdate), плюс моды с отсутствующим файлом (чиним сломанное)
+        const mods = (S.pack && S.pack.mods) || [];
+        const targets = mods.filter(m => m.hasUpdate
+            || (m.installed && !m.installed.fileExists && m.source));
+        if (!targets.length) {
             toast(t("mods.checked") + " (0)", "success");
             return;
         }
-        if (!confirm(t("mods.updateConfirm", { count: updatable }))) return;
+        if (!confirm(t("mods.updateConfirm", { count: targets.length }))) return;
+        body.ids = targets.map(m => m.id);
+    } else {
+        body.ids = ids;
     }
     const btn = ids ? (busyBtn || null) : $("btn-update-all");
     if (btn) setBtnLoading(btn, ids ? "mods.updating" : "mods.updateAll", ids ? "refresh" : "download", true);
-    const body = { profile: S.currentProfile };
-    if (ids) body.ids = ids;
+    // 1.1.1: сервер запускает фоновую задачу и отвечает сразу — прогресс
+    // (какой мод качается, сколько байт) виден в модалке опроса
     const result = await api("mods/update", { method: "POST", body });
     if (btn) setBtnLoading(btn, ids ? "mods.update" : "mods.updateAll", ids ? "refresh" : "download", false);
-    if (result.ok) {
-        const results = result.data.results || [];
-        const failed = results.filter(r => !r.success);
-        toast(t("mods.updated") + ": " + (results.length - failed.length) + "/" + results.length,
-            failed.length ? "warn" : "success");
-        await loadProfiles();
-        await loadPack();
+    if (result.ok && result.data && result.data.started) {
+        openUpdateProgress(result.data.type || "update");
+    } else if (result.error && result.error.code === "update_in_progress") {
+        // обновление уже идёт (запущено раньше или в другой вкладке): новую
+        // задачу не стартуем — просто открываем окно статуса бегущей
+        openUpdateProgress("update");
+    } else if (result.error && result.error.code === "backup_busy") {
+        toast(t("upd.backupBusy"), "warn");
     } else {
         toast(result.error ? result.error.message : t("common.error"), "error");
     }
 }
 
+/* ===== Прогресс фоновой задачи обновления/применения (1.1.1) ===== */
+
+/** Открыть модалку прогресса и начать опрос /api/mods/progress. */
+function openUpdateProgress(type) {
+    if (S.updateJob) {
+        // опрос уже идёт: просто снова показать модалку (могла быть закрыта)
+        if (!$("upd-progress-list")) openUpdateProgressModal(S.updateJob.type);
+        return;
+    }
+    S.updateJob = { type: type || "update", timer: null, openedAt: Date.now() };
+    openUpdateProgressModal(type || "update");
+    pollUpdateProgress();
+}
+
+/** Восстановить окно статуса после перезагрузки страницы: сервер в /api/mods
+ *  отдал снимок бегущей задачи — прицепляемся к ней и показываем прогресс. */
+function restoreUpdateJob(job) {
+    if (S.updateJob) return; // окно уже открыто — не дублируем
+    S.updateJob = { type: job.type || "update", timer: null, openedAt: Date.now() };
+    openUpdateProgressModal(job.type || "update");
+    renderUpdateProgress(job);
+    pollUpdateProgress();
+}
+
+function openUpdateProgressModal(type) {
+    openModal(
+        '<h3 class="modal-title" id="upd-title">' + esc(type === "apply" ? t("upd.applyTitle") : t("upd.title")) + "</h3>"
+        + '<div class="upd-phase" id="upd-phase"><span class="spin"></span><span id="upd-phase-text">'
+            + esc(t("upd.preparing")) + "</span></div>"
+        + '<div class="upd-bar"><div class="upd-bar-fill indeterminate" id="upd-bar"></div></div>'
+        + '<div class="upd-count muted small" id="upd-count"></div>'
+        + '<div class="upd-list" id="upd-progress-list" role="log" aria-live="polite"></div>',
+        [{ label: t("upd.hide"), onclick: closeModal, className: "btn ghost" },
+         { label: t("upd.stop"), onclick: stopUpdate, className: "btn danger", id: "upd-stop-btn" }]);
+}
+
+/** «Остановить»: начатые скачивания докачаются, не начатые — отменятся. */
+async function stopUpdate() {
+    const result = await api("mods/update/stop", { method: "POST", body: { profile: S.currentProfile } });
+    if (result.ok) {
+        markStopClicked();
+    } else {
+        toast(result.error ? result.error.message : t("common.error"), "error");
+    }
+}
+
+/** Кнопка «Остановить» после клика: неактивна до конца задачи. */
+function markStopClicked() {
+    const btn = $("upd-stop-btn");
+    if (btn) {
+        btn.disabled = true;
+        btn.textContent = t("upd.stopping");
+    }
+}
+
+async function pollUpdateProgress() {
+    if (!S.updateJob) return;
+    // предохранитель: сменили профиль с закрытой модалкой и прочие зависшие
+    // случаи — через 30 минут опрос останавливается сам (большие обновления
+    // на медленной сети могут идти дольше четверти часа)
+    if (Date.now() - (S.updateJob.openedAt || 0) > 30 * 60 * 1000) {
+        S.updateJob = null;
+        return;
+    }
+    let result = null;
+    try {
+        result = await api("mods/progress?profile=" + encodeURIComponent(S.currentProfile));
+    } catch (e) { /* сеть — просто повторим через интервал */ }
+    // сессия истекла — login-экран уже показан, опрос останавливаем
+    if (S.updateJob && result && result.error && result.error.code === "unauthorized") {
+        S.updateJob = null;
+        return;
+    }
+    if (S.updateJob && result && result.ok && result.data && result.data.job) {
+        const job = result.data.job;
+        renderUpdateProgress(job);
+        if (job.finished) {
+            // «свежий» финиш — наш; давно завершённая задача (мимо нас) не тостится
+            const fresh = !job.finishedAt || Date.now() - job.finishedAt < 30000;
+            finishUpdateProgress(job, fresh);
+            return;
+        }
+    }
+    if (S.updateJob) {
+        S.updateJob.timer = setTimeout(pollUpdateProgress, 700);
+    }
+}
+
+function updPhaseText(job) {
+    if (job.stopRequested && !job.finished) {
+        return t("upd.stoppingPhase");
+    }
+    switch (job.phase) {
+        case "checking":
+            return t("upd.checking") + (job.checkTotal > 0 ? " " + job.checkDone + "/" + job.checkTotal : "");
+        case "downloading": return t("upd.downloading");
+        case "rehashing": return t("upd.rehashing");
+        case "done": return t("upd.done");
+        case "error": return t("upd.failed") + (job.error ? ": " + job.error : "");
+        default: return t("upd.preparing");
+    }
+}
+
+function updBytesText(m) {
+    if (m.status !== "downloading") return "";
+    if (m.totalBytes > 0) return fmtBytes(m.downloaded) + " / " + fmtBytes(m.totalBytes);
+    return m.downloaded > 0 ? fmtBytes(m.downloaded) : "";
+}
+
+function updRow(m) {
+    const icons = { waiting: "clock", checking: "search", downloading: "download", done: "check", skipped: "info", cancelled: "x", error: "alert" };
+    const statusKey = "upd.st" + m.status.charAt(0).toUpperCase() + m.status.slice(1);
+    const parts = [t(statusKey)];
+    if (m.detail) parts.push(esc(m.detail));
+    const bytes = updBytesText(m);
+    if (bytes) parts.push(bytes);
+    const row = document.createElement("div");
+    row.className = "upd-row st-" + m.status;
+    row.innerHTML = icon(icons[m.status] || "clock")
+        + '<span class="upd-name">' + esc(m.title || m.id) + "</span>"
+        + '<span class="upd-meta">' + parts.join(" · ") + "</span>";
+    return row;
+}
+
+function renderUpdateProgress(job) {
+    // модалка могла быть закрыта/заменена — тогда только ждём финиша
+    const phaseText = $("upd-phase-text");
+    if (!phaseText) return;
+    // тип мог отличаться (прицепились к бегущей задаче) — заголовок честный
+    const titleEl = $("upd-title");
+    if (titleEl) titleEl.textContent = job.type === "apply" ? t("upd.applyTitle") : t("upd.title");
+    phaseText.textContent = updPhaseText(job);
+    // на финише спиннер фазы больше не крутится
+    const spin = $("upd-phase").querySelector(".spin");
+    if (spin) spin.style.display = job.finished ? "none" : "";
+    // остановка запрошена: докачиваем начатое, очередь отменяется — кнопка больше не нужна
+    if (job.stopRequested && !job.finished) markStopClicked();
+    const bar = $("upd-bar");
+    if (bar) {
+        if (job.total > 0) {
+            bar.style.width = Math.round(100 * Math.min(1, job.completed / job.total)) + "%";
+            bar.classList.remove("indeterminate");
+        } else {
+            bar.style.width = "100%";
+            bar.classList.add("indeterminate");
+        }
+    }
+    const count = $("upd-count");
+    if (count) count.textContent = job.total > 0 ? (job.completed + " / " + job.total) : "";
+    const list = $("upd-progress-list");
+    if (list) {
+        list.innerHTML = "";
+        (job.mods || []).forEach(m => list.appendChild(updRow(m)));
+    }
+}
+
+function finishUpdateProgress(job, fresh) {
+    if (S.updateJob && S.updateJob.timer) clearTimeout(S.updateJob.timer);
+    const type = (job && job.type) || (S.updateJob ? S.updateJob.type : "update");
+    S.updateJob = null;
+    if (!fresh) return;
+    const results = job.results || [];
+    const failed = results.filter(r => r.error);
+    const cancelled = results.filter(r => r.cancelled).length;
+    if (job.ok) {
+        if (job.stopped) {
+            // задача остановлена кнопкой: сколько докачано, сколько отменено
+            const done = results.filter(r => !r.error && !r.cancelled).length;
+            toast(t("upd.stoppedToast", { done: done, cancelled: cancelled }), "warn");
+        } else if (type === "apply") {
+            toast(t("mods.applied"), failed.length ? "warn" : "success");
+        } else {
+            toast(t("mods.updated") + ": " + (results.length - failed.length - cancelled) + "/"
+                + Math.max(1, results.length - cancelled),
+                failed.length ? "warn" : "success");
+        }
+    } else {
+        toast(job.error ? job.error : t("common.error"), "error");
+    }
+    setTimeout(async () => {
+        if ($("upd-progress-list")) closeModal();
+        await loadProfiles();
+        await loadPack();
+    }, 900);
+}
+
 async function applyComposition() {
-    if (S.session.role !== "admin") return;
+    if (!isAdmin()) return;
     if (!confirm(t("mods.applyConfirm"))) return;
     // Включение/выключение модов убрано: состав = ВСЕ моды модпака
     // («скачан — значит нужен»). «Применить состав» доставляет недостающие
@@ -881,25 +1107,31 @@ async function applyComposition() {
     const conflicts = packConflicts();
     const btn = $("btn-apply");
     setBtnLoading(btn, "mods.apply", "zap", true);
+    // 1.1.1: сервер отвечает сразу (фоновая задача), прогресс — в модалке
     const result = await api("mods/apply", {
         method: "POST",
         body: { profile: S.currentProfile },
     });
     setBtnLoading(btn, "mods.apply", "zap", false);
-    if (result.ok) {
-        toast(t("mods.applied"), "success");
-        if (conflicts.length) {
-            toast(t("mods.conflictApplyWarn", { pairs: conflictPairsText(conflicts) }), "warn");
-        }
-        await loadProfiles();
-        await loadPack();
+    if (result.ok && result.data && result.data.started) {
+        openUpdateProgress("apply");
+    } else if (result.error && result.error.code === "update_in_progress") {
+        openUpdateProgress("apply");
+        return;
+    } else if (result.error && result.error.code === "backup_busy") {
+        toast(t("upd.backupBusy"), "warn");
+        return;
     } else {
         toast(result.error ? result.error.message : t("common.error"), "error");
+        return;
+    }
+    if (conflicts.length) {
+        toast(t("mods.conflictApplyWarn", { pairs: conflictPairsText(conflicts) }), "warn");
     }
 }
 
 async function rehash() {
-    if (S.session.role !== "admin") return;
+    if (!isAdmin()) return;
     const btn = $("btn-rehash");
     setBtnLoading(btn, "mods.rehash", "hash", true);
     const result = await api("rehash", { method: "POST", body: { profile: S.currentProfile } });
@@ -1071,7 +1303,13 @@ function initSearchTab() {
 }
 
 function isAdmin() {
-    return !!(S.session && S.session.role === "admin");
+    return !!(S.session && (S.session.role === "admin" || S.session.role === "superadmin"));
+}
+
+/** Суперадмин (логин задан вручную в config.superAdmins):
+ *  полные админ-права + управление ролями других админов. */
+function isSuperAdmin() {
+    return !!(S.session && S.session.role === "superadmin");
 }
 
 /** Дефолт фильтров — версия и загрузчик выбранного профиля (как в Prism Launcher).
@@ -1241,7 +1479,7 @@ function renderSearchResults(items) {
         return;
     }
     empty.classList.add("hidden");
-    const isAdmin = S.session && S.session.role === "admin";
+    const isAdmin = S.session && (S.session.role === "admin" || S.session.role === "superadmin");
     items.forEach(hit => grid.appendChild(renderSearchCard(hit, isAdmin)));
 }
 
@@ -1314,7 +1552,7 @@ function renderSearchCard(hit, isAdmin) {
 /** Доступна ли кнопка «Предложить» наблюдателю. */
 function suggestAvailable() {
     if (!S.session) return false;
-    if (S.session.role === "admin") return false;
+    if (isAdmin()) return false;
     if (S.session.suggestEnabled === false || S.session.suggestBanned) return false;
     const limit = S.session.suggestLimit || 0;
     const pending = S.mine ? S.mine.pending : (S.session.suggestPending || 0);
@@ -1358,7 +1596,7 @@ async function suggestProject(source, projectId, btn) {
 
 /** Свои предложения наблюдателя: список + счётчик лимита. */
 async function loadMine() {
-    if (!S.session || S.session.role === "admin") return;
+    if (!S.session || isAdmin()) return;
     const result = await api("mods/suggestions/mine");
     if (!result.ok) return;
     S.mine = result.data || { items: [], pending: 0, limit: 0, banned: false, enabled: true };
@@ -1437,6 +1675,8 @@ function renderSettings() {
     $("set-defaultOptionalEnabled").checked = !!S.settings.defaultOptionalEnabled;
     $("set-defaultChannel").value = S.settings.defaultChannel || "release";
     $("set-cacheTtlMinutes").value = S.settings.cacheTtlMinutes || 10;
+    $("set-maxConcurrentDownloads").value = S.settings.maxConcurrentDownloads || 4;
+    $("set-httpTimeoutSeconds").value = S.settings.httpTimeoutSeconds || 30;
     $("set-defaultType").value = ["mod", "resourcepack", "shader"].includes(S.settings.defaultProjectType)
         ? S.settings.defaultProjectType : "mod";
     $("set-suggestEnabled").checked = !!S.settings.suggestEnabled;
@@ -1589,6 +1829,8 @@ async function saveModuleSettings(event) {
             updateSourcePriority: S.settings.priority,
             defaultChannel: $("set-defaultChannel").value,
             cacheTtlMinutes: parseInt($("set-cacheTtlMinutes").value, 10) || 10,
+            maxConcurrentDownloads: parseInt($("set-maxConcurrentDownloads").value, 10) || 4,
+            httpTimeoutSeconds: parseInt($("set-httpTimeoutSeconds").value, 10) || 30,
             autoRehash: $("set-autoRehash").checked,
             verifyHash: $("set-verifyHash").checked,
             allowWithoutHash: $("set-allowWithoutHash").checked,
@@ -1826,6 +2068,7 @@ function openModal(bodyHtml, buttons) {
         buttons.forEach(b => {
             const btn = document.createElement("button");
             btn.type = "button";
+            if (b.id) btn.id = b.id;
             btn.className = b.className || "btn";
             btn.textContent = b.label;
             btn.addEventListener("click", b.onclick);
@@ -2032,15 +2275,96 @@ async function loadUsers() {
     });
 }
 
+/* ================= Роли админов (только суперадмин) ================= */
+/** Таблица известных логинов и их эффективных ролей.
+ *  Эффективная роль: суперадмин > «наблюдатель» (оверрайд) > базовая роль источника. */
+async function loadAdminRoles() {
+    if (!isSuperAdmin()) return;
+    const result = await api("admins");
+    if (!result.ok) {
+        toast(result.error ? result.error.message : t("common.error"), "error");
+        return;
+    }
+    const tbody = $("table-admin-roles").querySelector("tbody");
+    tbody.innerHTML = "";
+    (result.data.admins || []).forEach(admin => {
+        const tr = document.createElement("tr");
+        const effective = admin.effectiveRole || admin.baseRole || "viewer";
+        tr.innerHTML = `<td>${esc(admin.login)}</td>
+            <td>${esc(admin.source || "")}${admin.enabled ? "" : " · " + esc(t("admin.off"))}</td>
+            <td><span class="role-chip${effective === "viewer" ? " viewer" : (effective === "superadmin" ? " super" : "")}">${esc(effective)}</span></td>
+            <td>${admin.forcedViewer ? esc(t("admin.roles.forced")) : "—"}</td>
+            <td></td>`;
+        const cell = tr.children[4];
+        if (!admin.canOverride) {
+            const note = document.createElement("span");
+            note.className = "muted small";
+            note.textContent = admin.superAdmin ? t("admin.roles.superNote") : "";
+            cell.appendChild(note);
+        } else {
+            const btn = document.createElement("button");
+            btn.type = "button";
+            btn.className = "btn small" + (admin.forcedViewer ? "" : " danger");
+            btn.textContent = admin.forcedViewer ? t("admin.roles.allowAdmin") : t("admin.roles.makeViewer");
+            btn.addEventListener("click", async () => {
+                const makeViewer = !admin.forcedViewer;
+                const res = await api("admins/override", {
+                    method: "POST",
+                    body: { login: admin.login, viewer: String(makeViewer) },
+                });
+                if (res.ok) {
+                    toast(t(makeViewer ? "admin.roles.viewerSet" : "admin.roles.viewerCleared"), "success");
+                    await loadAdminRoles();
+                } else {
+                    toast(res.error ? res.error.message : t("common.error"), "error");
+                }
+            });
+            cell.appendChild(btn);
+        }
+        tbody.appendChild(tr);
+    });
+    // Полный список помеченных логинов (в т.ч. те, кто сейчас не в сети)
+    const viewers = result.data.viewers || [];
+    const extra = $("roles-viewers-extra");
+    if (extra) {
+        extra.textContent = viewers.length
+            ? t("admin.roles.viewersList", { list: viewers.join(", ") })
+            : "";
+    }
+}
+
+/** Принудительно сделать наблюдателем произвольный логин — например, админа
+ *  из БД лаунчера, которого нет в таблице (он появится здесь после первого входа). */
+async function addForcedViewer() {
+    const input = $("viewer-add-input");
+    if (!input) return;
+    const login = (input.value || "").trim();
+    if (!login) return;
+    const res = await api("admins/override", {
+        method: "POST",
+        body: { login, viewer: "true" },
+    });
+    if (res.ok) {
+        toast(t("admin.roles.viewerSet"), "success");
+        input.value = "";
+        await loadAdminRoles();
+    } else {
+        toast(res.error ? res.error.message : t("common.error"), "error");
+    }
+}
+
 function switchSecurityTab(name) {
-    ["bans", "ipfilter", "audit", "users"].forEach(n => {
-        $("admin-" + n).classList.toggle("hidden", n !== name);
-        $("subtab-" + n).classList.toggle("active", n === name);
+    ["bans", "ipfilter", "audit", "users", "roles"].forEach(n => {
+        const section = $("admin-" + n);
+        const tab = $("subtab-" + n);
+        if (section) section.classList.toggle("hidden", n !== name);
+        if (tab) tab.classList.toggle("active", n === name);
     });
     if (name === "bans") loadBans();
     if (name === "ipfilter") loadIpFilter();
     if (name === "audit") loadAudit();
     if (name === "users") loadUsers();
+    if (name === "roles") loadAdminRoles();
 }
 
 /** Поднавигация «Настройки»: Обновления / Безопасность. */
@@ -2175,9 +2499,9 @@ function downloadErrorReason(raw) {
 
 /* ================= Навигация ================= */
 function switchMainTab(name) {
-    const isAdmin = S.session && S.session.role === "admin";
-    if ((name === "settings" || name === "suggest") && !isAdmin) return;
-    ["mods", "search", "suggest", "settings"].forEach(n => {
+    const isAdmin = S.session && (S.session.role === "admin" || S.session.role === "superadmin");
+    if ((name === "settings" || name === "suggest" || name === "backups") && !isAdmin) return;
+    ["mods", "search", "suggest", "settings", "backups"].forEach(n => {
         const tab = $("tab-" + n);
         if (tab) {
             tab.classList.toggle("active", name === n);
@@ -2189,6 +2513,7 @@ function switchMainTab(name) {
     if (name === "settings") switchSettingsTab("updates");
     if (name === "search") onSearchTabOpen();
     if (name === "suggest") loadSuggestions();
+    if (name === "backups") loadBackups();
 }
 
 /* ================= Темы оформления (1.1.0) ================= */
@@ -2827,6 +3152,17 @@ document.addEventListener("DOMContentLoaded", async () => {
     on("tab-search", "click", () => switchMainTab("search"));
     on("tab-suggest", "click", () => switchMainTab("suggest"));
     on("tab-settings", "click", () => switchMainTab("settings"));
+    on("tab-backups", "click", () => switchMainTab("backups"));
+    // бекапы
+    on("btn-backup-create", "click", createBackup);
+    on("btn-backup-folders-save", "click", saveBackupFolders);
+    on("btn-backup-folders-reset", "click", resetBackupFolders);
+    const foldersList = $("backup-folders-list");
+    if (foldersList) {
+        foldersList.addEventListener("change", () => {
+            S.backupsFoldersDirty = true; // не затирать несохранённый выбор при опросе
+        });
+    }
     $("subtab-settings-updates").addEventListener("click", () => switchSettingsTab("updates"));
     $("subtab-settings-appearance").addEventListener("click", () => switchSettingsTab("appearance"));
     $("subtab-settings-security").addEventListener("click", () => switchSettingsTab("security"));
@@ -2836,6 +3172,16 @@ document.addEventListener("DOMContentLoaded", async () => {
     $("subtab-ipfilter").addEventListener("click", () => switchSecurityTab("ipfilter"));
     $("subtab-audit").addEventListener("click", () => switchSecurityTab("audit"));
     $("subtab-users").addEventListener("click", () => switchSecurityTab("users"));
+    // Роли админов: вкладка видна только суперадмину (элемент может
+    // отсутствовать в кастомной разметке админа — не роняем инициализацию)
+    const rolesTab = $("subtab-roles");
+    if (rolesTab) rolesTab.addEventListener("click", () => switchSecurityTab("roles"));
+    const viewerAdd = $("viewer-add");
+    if (viewerAdd) viewerAdd.addEventListener("click", addForcedViewer);
+    const viewerInput = $("viewer-add-input");
+    if (viewerInput) viewerInput.addEventListener("keydown", e => {
+        if (e.key === "Enter") addForcedViewer();
+    });
     // действия модпака
     on("btn-check", "click", checkUpdates);
     on("btn-update-all", "click", () => updateMods(null));
@@ -2954,3 +3300,347 @@ document.addEventListener("DOMContentLoaded", async () => {
     });
     await boot();
 });
+
+/* ================= Бекапы (1.1.0, admin) ================= */
+
+/** 1234567 → «1.2 MiB» — размеры бекапов и общий размер. */
+function fmtBytes(n) {
+    n = Number(n) || 0;
+    if (n >= 1024 ** 3) return (n / 1024 ** 3).toFixed(2).replace(/\.?0+$/, "") + " GiB";
+    if (n >= 1024 ** 2) return (n / 1024 ** 2).toFixed(1).replace(/\.0$/, "") + " MiB";
+    if (n >= 1024) return (n / 1024).toFixed(1).replace(/\.0$/, "") + " KiB";
+    return n + " B";
+}
+
+/** Имя бекапа по умолчанию — дата и время прямо сейчас (как на сервере). */
+function defaultBackupName() {
+    const d = new Date();
+    const pad = (x) => String(x).padStart(2, "0");
+    return d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate())
+            + " " + pad(d.getHours()) + ":" + pad(d.getMinutes());
+}
+
+function stopBackupsPoll() {
+    if (S.backupsTimer) {
+        clearTimeout(S.backupsTimer);
+        S.backupsTimer = null;
+    }
+}
+
+/** Загрузка списка бекапов профиля (+ опрос активной задачи). */
+async function loadBackups() {
+    if (!S.currentProfile) {
+        renderBackups({ backups: [], totalSize: 0, count: 0, job: null, folders: [] });
+        return;
+    }
+    const result = await api("backups?profile=" + encodeURIComponent(S.currentProfile));
+    if (!result.ok) {
+        toast(result.error ? result.error.message : t("common.error"), "error");
+        stopBackupsPoll();
+        return;
+    }
+    S.backups = result.data;
+    renderBackups(result.data);
+    const job = result.data.job;
+    if (job) {
+        S.backupsJobSeen = true;
+        stopBackupsPoll();
+        S.backupsTimer = setTimeout(loadBackups, 2500);
+    } else {
+        stopBackupsPoll();
+        if (S.backupsJobSeen) {
+            S.backupsJobSeen = false;
+            const last = result.data.lastResult;
+            if (last && Date.now() - last.finishedAt < 120000) {
+                toast((last.ok ? t("backups.done") : t("backups.failed")) + ": " + last.message,
+                        last.ok ? "success" : "error");
+                // состав модпака мог измениться — обновляем и его
+                loadMods(S.currentProfile);
+            }
+        }
+    }
+}
+
+function renderBackups(data) {
+    const tbody = $("backups-tbody");
+    if (!tbody) return;
+    const isAdmin = S.session && (S.session.role === "admin" || S.session.role === "superadmin");
+    const disabled = data.enabled === false;
+    $("backups-total").textContent = disabled ? "—" : fmtBytes(data.totalSize);
+    $("backups-count").textContent = disabled ? "" : "(" + (data.count || 0) + ")";
+    const empty = disabled || (data.count || 0) === 0;
+    $("backups-empty").textContent = disabled ? t("backups.disabled") : t("backups.empty");
+    $("backups-empty").classList.toggle("hidden", !empty);
+    $("table-backups").classList.toggle("hidden", empty);
+    $("btn-backup-create").disabled = disabled || !isAdmin;
+    $("btn-backup-folders-save").disabled = disabled || !isAdmin;
+    $("btn-backup-folders-reset").disabled = disabled || !isAdmin;
+    const jobEl = $("backup-job");
+    if (data.job) {
+        jobEl.classList.remove("hidden");
+        const label = data.job.type === "restore" ? t("backups.jobRestore") : t("backups.jobCreate");
+        jobEl.innerHTML = icon("refresh") + "<span>" + esc(label)
+                + (data.job.message ? " — " + esc(data.job.message) : "") + "</span>";
+    } else {
+        jobEl.classList.add("hidden");
+    }
+    if (!disabled) {
+        renderBackupFolders(data);
+        const nameInput = $("backup-name");
+        if (document.activeElement !== nameInput && !nameInput.value) {
+            nameInput.value = defaultBackupName();
+        }
+    } else {
+        const list = $("backup-folders-list");
+        if (list) list.replaceChildren();
+    }
+    tbody.replaceChildren();
+    for (const b of data.backups || []) {
+        tbody.appendChild(backupRow(b, isAdmin));
+    }
+}
+
+/** Чекбоксы «что бекапить»: папки из папки сборки профиля.
+ *  Отмечены — текущий выбор (сохранённый или дефолт). Пока админ меняет
+ *  галочки без сохранения — перерисовку пропускаем (опрос задачи каждые 2.5 с
+ *  не должен сбивать выбор). */
+function renderBackupFolders(data) {
+    const box = $("backup-folders-list");
+    if (!box) return;
+    if (S.backupsFoldersDirty) return;
+    const isAdmin = S.session && (S.session.role === "admin" || S.session.role === "superadmin");
+    const selected = new Set(data.folders || []);
+    const list = data.profileFolders || [];
+    box.replaceChildren();
+    if (!list.length) {
+        const empty = document.createElement("p");
+        empty.className = "muted small";
+        empty.textContent = t("backups.foldersEmpty");
+        box.appendChild(empty);
+        return;
+    }
+    for (const folder of list) {
+        const label = document.createElement("label");
+        label.className = "folder-check" + (folder.exists ? "" : " missing");
+        const input = document.createElement("input");
+        input.type = "checkbox";
+        input.value = folder.name;
+        input.checked = selected.has(folder.name);
+        input.disabled = !isAdmin;
+        const name = document.createElement("span");
+        name.textContent = folder.name;
+        label.append(input, name);
+        if (!folder.exists) {
+            const miss = document.createElement("span");
+            miss.className = "muted small";
+            miss.textContent = " — " + t("backups.folderMissing");
+            label.appendChild(miss);
+        }
+        box.appendChild(label);
+    }
+}
+
+function backupRow(b, isAdmin) {
+    const tr = document.createElement("tr");
+    const name = document.createElement("td");
+    name.innerHTML = "<strong>" + esc(b.name) + "</strong>"
+            + (b.foreign ? ' <span class="badge-foreign">' + esc(t("backups.foreignBadge")) + "</span>" : "")
+            + (b.frozen ? ' <span class="badge-frozen">' + esc(t("backups.frozen")) + "</span>" : "");
+    const date = document.createElement("td");
+    date.textContent = fmtTime(b.createdAt);
+    const size = document.createElement("td");
+    size.textContent = fmtBytes(b.size);
+    const content = document.createElement("td");
+    content.className = "muted small";
+    content.textContent = t("backups.contentSummary")
+            .replace("{remote}", b.remoteCount || 0).replace("{files}", b.fileCount || 0);
+    const actions = document.createElement("td");
+    actions.className = "row-actions";
+    if (isAdmin) {
+        actions.appendChild(actionBtn("backups.rename", () => backupRenameModal(b), "note"));
+        actions.appendChild(actionBtn(b.frozen ? "backups.unfreeze" : "backups.freeze",
+                () => backupFreeze(b, !b.frozen), "shield"));
+        actions.appendChild(actionBtn("backups.download", () => backupDownload(b), "download"));
+        actions.appendChild(actionBtn("backups.restore", () => backupRestoreModal(b), "refresh"));
+        actions.appendChild(actionBtn("backups.delete", () => backupDeleteModal(b), "trash"));
+    }
+    tr.append(name, date, size, content, actions);
+    return tr;
+}
+
+function actionBtn(key, onclick, iconName) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "btn ghost small";
+    btn.title = t(key);
+    btn.innerHTML = icon(iconName);
+    btn.addEventListener("click", onclick);
+    return btn;
+}
+
+async function createBackup() {
+    if (!S.currentProfile) return;
+    const btn = $("btn-backup-create");
+    btn.disabled = true;
+    const name = $("backup-name").value.trim() || defaultBackupName();
+    const result = await api("backups/create", {
+        method: "POST",
+        body: { profile: S.currentProfile, name: name },
+    });
+    btn.disabled = false;
+    if (result.ok) {
+        toast(t("backups.started"), "success");
+        $("backup-name").value = "";
+        S.backupsJobSeen = false; // это наша задача — тост по завершении и так покажем
+        setTimeout(loadBackups, 300);
+    } else {
+        toast(result.error ? result.error.message : t("common.error"), "error");
+    }
+}
+
+function backupRenameModal(b) {
+    const input = '<div class="modal-field"><input type="text" id="backup-rename-input" class="input" maxlength="100" value="' + esc(b.name) + '"></div>';
+    const modal = openModal('<h3 class="modal-title">' + esc(t("backups.renameTitle")) + "</h3>" + input, [
+        {
+            label: t("common.cancel"), className: "btn ghost", onclick: closeModal,
+        },
+        {
+            label: t("mods.save"), className: "btn primary",
+            onclick: async () => {
+                const value = document.getElementById("backup-rename-input").value.trim();
+                if (!value) return;
+                const result = await api("backups/rename", {
+                    method: "POST",
+                    body: { profile: S.currentProfile, id: b.id, name: value },
+                });
+                closeModal();
+                if (result.ok) {
+                    toast(t("backups.renamed"), "success");
+                    loadBackups();
+                } else {
+                    toast(result.error ? result.error.message : t("common.error"), "error");
+                }
+            },
+        },
+    ]);
+    return modal;
+}
+
+async function backupFreeze(b, frozen) {
+    const result = await api("backups/freeze", {
+        method: "POST",
+        body: { profile: S.currentProfile, id: b.id, frozen: frozen },
+    });
+    if (result.ok) {
+        toast(t(frozen ? "backups.frozenMsg" : "backups.unfrozenMsg"), "success");
+        loadBackups();
+    } else {
+        toast(result.error ? result.error.message : t("common.error"), "error");
+    }
+}
+
+function backupRestoreModal(b) {
+    const textKey = b.foreign ? "backups.confirmRestoreForeign" : "backups.confirmRestoreText";
+    openModal(
+            '<h3 class="modal-title">' + esc(t("backups.confirmRestoreTitle")) + "</h3>"
+            + '<p class="muted">' + esc(t(textKey).replace("{name}", b.name)) + "</p>",
+            [
+                { label: t("common.cancel"), className: "btn ghost", onclick: closeModal },
+                {
+                    label: t("backups.restore"), className: "btn primary",
+                    onclick: async () => {
+                        closeModal();
+                        const result = await api("backups/restore", {
+                            method: "POST",
+                            body: { profile: S.currentProfile, id: b.id },
+                        });
+                        if (result.ok) {
+                            toast(t("backups.restoreStarted"), "success");
+                            S.backupsJobSeen = true;
+                            setTimeout(loadBackups, 300);
+                        } else {
+                            toast(result.error ? result.error.message : t("common.error"), "error");
+                        }
+                    },
+                },
+            ]);
+}
+
+function backupDeleteModal(b) {
+    if (b.frozen) {
+        toast(t("backups.frozenDelete"), "warn");
+        return;
+    }
+    openModal(
+            '<h3 class="modal-title">' + esc(t("backups.confirmDeleteTitle")) + "</h3>"
+            + '<p class="muted">' + esc(t("backups.confirmDeleteText").replace("{name}", b.name)) + "</p>",
+            [
+                { label: t("common.cancel"), className: "btn ghost", onclick: closeModal },
+                {
+                    label: t("backups.delete"), className: "btn danger",
+                    onclick: async () => {
+                        closeModal();
+                        const result = await api("backups/delete", {
+                            method: "POST",
+                            body: { profile: S.currentProfile, id: b.id },
+                        });
+                        if (result.ok) {
+                            toast(t("backups.deleted"), "success");
+                            loadBackups();
+                        } else {
+                            toast(result.error ? result.error.message : t("common.error"), "error");
+                        }
+                    },
+                },
+            ]);
+}
+
+function backupDownload(b) {
+    const url = API_BASE + "backups/download?profile="
+            + encodeURIComponent(S.currentProfile) + "&id=" + encodeURIComponent(b.id);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+}
+
+async function saveBackupFolders() {
+    if (!S.currentProfile) return;
+    // Собираем отмеченные галочками папки
+    const folders = [...document.querySelectorAll("#backup-folders-list input[type=checkbox]:checked")]
+            .map(el => el.value)
+            .filter(Boolean);
+    if (!folders.length) {
+        toast(t("backups.foldersNone"), "warn");
+        return;
+    }
+    const result = await api("backups/folders", {
+        method: "POST",
+        body: { profile: S.currentProfile, folders: folders },
+    });
+    if (result.ok) {
+        S.backupsFoldersDirty = false;
+        toast(t("backups.foldersSaved"), "success");
+        loadBackups();
+    } else {
+        toast(result.error ? result.error.message : t("common.error"), "error");
+    }
+}
+
+async function resetBackupFolders() {
+    if (!S.currentProfile) return;
+    // Пустой список = дефолт (три стандартные папки контента)
+    const result = await api("backups/folders", {
+        method: "POST",
+        body: { profile: S.currentProfile, folders: [] },
+    });
+    if (result.ok) {
+        S.backupsFoldersDirty = false;
+        toast(t("backups.foldersSaved"), "success");
+        loadBackups();
+    } else {
+        toast(result.error ? result.error.message : t("common.error"), "error");
+    }
+}

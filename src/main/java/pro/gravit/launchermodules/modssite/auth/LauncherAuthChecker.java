@@ -117,6 +117,43 @@ public class LauncherAuthChecker {
         return Result.ok(user.getUsername(), admin);
     }
 
+    /**
+     * Живая проверка признака админа по логину БЕЗ пароля: берём свежую запись
+     * пользователя из auth core (БД/файл лаунчера) и прогоняем adminCheck
+     * (права или SQL-запрос). Используется RoleResolver для пересчёта ролей
+     * существующих сессий: админ, назначенный в БД или в конфиге лаунчера,
+     * подхватывается при следующем же запросе без повторного входа.
+     */
+    public Result checkAdminOnly(String login) {
+        AuthProviderPair pair;
+        try {
+            pair = resolvePair();
+        } catch (Throwable e) {
+            return Result.error(e.getMessage());
+        }
+        if (pair == null || pair.core == null) {
+            return Result.error("auth core not available");
+        }
+        User user;
+        try {
+            user = pair.core.getUserByUsername(login);
+        } catch (Throwable e) {
+            logger.error("Cannot fetch user '{}' for live admin check", login, e);
+            return Result.error("auth core error");
+        }
+        if (user == null) {
+            return Result.of(Result.Status.USER_NOT_FOUND);
+        }
+        boolean admin;
+        try {
+            admin = isAdmin(user);
+        } catch (Throwable e) {
+            logger.error("adminCheck failed for '{}'", login, e);
+            return Result.error("adminCheck error");
+        }
+        return Result.ok(user.getUsername(), admin);
+    }
+
     /** Определить признак админа согласно конфигу. */
     public boolean isAdmin(User user) {
         String type = config.launcherAuth.adminCheck.type == null

@@ -7,11 +7,14 @@ import pro.gravit.launcher.base.modules.LauncherInitContext;
 import pro.gravit.launcher.base.modules.LauncherModule;
 import pro.gravit.launcher.base.modules.LauncherModuleInfoBuilder;
 import pro.gravit.launcher.base.modules.events.ClosePhase;
+import pro.gravit.launchermodules.modssite.auth.AdminRoleOverrides;
 import pro.gravit.launchermodules.modssite.auth.AuthService;
 import pro.gravit.launchermodules.modssite.auth.LauncherAuthChecker;
 import pro.gravit.launchermodules.modssite.auth.PasswordHasher;
+import pro.gravit.launchermodules.modssite.auth.RoleResolver;
 import pro.gravit.launchermodules.modssite.auth.SessionManager;
 import pro.gravit.launchermodules.modssite.commands.ModsCommand;
+import pro.gravit.launchermodules.modssite.mods.BackupService;
 import pro.gravit.launchermodules.modssite.mods.CurseForgeApiProvider;
 import pro.gravit.launchermodules.modssite.mods.ImportService;
 import pro.gravit.launchermodules.modssite.mods.ModpackService;
@@ -45,8 +48,8 @@ import java.util.concurrent.TimeUnit;
  * (эскалация банов IP, whitelist/blacklist), TOTP, аудит.
  */
 public class ModsSiteModule extends LauncherModule {
-    public static final Version version = new Version(1, 1, 0, 0, Version.Type.LTS);
-    public final String versionString = "1.1.0";
+    public static final Version version = new Version(1, 1, 1, 0, Version.Type.LTS);
+    public final String versionString = "1.1.1";
     public final Logger logger = LogManager.getLogger(ModsSiteModule.class);
 
     // Состояние и сервисы (инициализируются в init)
@@ -64,12 +67,17 @@ public class ModsSiteModule extends LauncherModule {
     public SessionManager sessions;
     public AuthService authService;
     public LauncherAuthChecker launcherAuthChecker;
+    /** Живые роли: пересчёт админа/суперадмина/наблюдателя на каждом запросе. */
+    public RoleResolver roleResolver;
+    /** Оверрайды «наблюдатель» для админов (панель Безопасность -> Роли, суперадмин). */
+    public AdminRoleOverrides adminRoles;
     public ModpackService modpacks;
     public UpdateService updates;
     public ImportService imports;
     public SuggestionService suggestions;
     public ModrinthApiProvider modrinthProvider;
     public CurseForgeApiProvider curseforgeProvider;
+    public BackupService backups;
     /** Сервлет на /mods (сайт + API по пути /mods). */
     public NettyWebAPIHandler.SeverletPathPair severletPair;
     /** Сервлет в корне "/" (root-режим для доменов из web.siteDomains):
@@ -152,7 +160,8 @@ public class ModsSiteModule extends LauncherModule {
 
     private synchronized void init(LaunchServer server, Path configDir) {
         this.server = server;
-        // 1. Конфиг
+        // 1. Конфиг (путь запоминаем для живой перечитки при изменении файла)
+        configFilePath = modulesConfigManager.getModuleConfig(moduleInfo.name);
         try {
             configurable.loadConfig();
         } catch (IOException e) {
@@ -160,6 +169,7 @@ public class ModsSiteModule extends LauncherModule {
             config = configurable.getDefaultConfig();
         }
         config.normalize();
+        recordConfigMtime();
         // Уровень вывода в консоль (logging.consoleLevel): применяем как можно
         // раньше — чтобы и сами сообщения инициализации подчинялись настройке
         ModsSiteLogLevels.apply(config.logging.consoleLevel);
@@ -180,6 +190,9 @@ public class ModsSiteModule extends LauncherModule {
         sessions.load();
         launcherAuthChecker = new LauncherAuthChecker(server, config);
         authService = new AuthService(config, ipBans, launcherAuthChecker);
+        adminRoles = new AdminRoleOverrides(configDir.resolve("admin-roles.json"));
+        adminRoles.load();
+        roleResolver = new RoleResolver(this);
         // 3. Моды
         modrinthProvider = new ModrinthApiProvider(config.mods.modrinth, Math.max(1, config.mods.cacheTtlMinutes) * 60_000L);
         curseforgeProvider = new CurseForgeApiProvider(config.mods.curseforge, Math.max(1, config.mods.cacheTtlMinutes) * 60_000L);
@@ -187,6 +200,8 @@ public class ModsSiteModule extends LauncherModule {
         modpacks = new ModpackService(server, config, configDir);
         imports = new ImportService(config, modpacks, updates);
         suggestions = new SuggestionService(configDir.resolve("suggestions.json"));
+        backups = new BackupService(config, modpacks, updates, audit,
+                configDir.resolve("backups"), versionString);
         // 4. Команды
         server.commandHandler.registerCommand("mods", new ModsCommand(server, this));
         // 5. Веб
@@ -298,8 +313,54 @@ public class ModsSiteModule extends LauncherModule {
     public void saveConfig() {
         try {
             configurable.saveConfig();
+            recordConfigMtime(); // сохранение само не должно триггерить перечитку
         } catch (IOException e) {
             logger.error("Cannot save config", e);
+        }
+    }
+
+    /** Путь конфиг-файла модуля (для живой перечитки). */
+    private transient Path configFilePath;
+    /** mtime конфига на момент последней загрузки/сохранения. */
+    private volatile long configLoadedMtime = -1;
+
+    private void recordConfigMtime() {
+        if (configFilePath == null) return;
+        try {
+            configLoadedMtime = Files.getLastModifiedTime(configFilePath).toMillis();
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /**
+     * Живая подгрузка конфига: админ правит Config.json вручную (аккаунты,
+     * роли, суперадмины, домены) — изменения подхватываются при следующем
+     * же запросе, без «mods reload» и без перезапуска сервера.
+     * Стоимость на запрос — один stat() файла.
+     */
+    public void ensureFreshConfig() {
+        Path path = configFilePath;
+        if (path == null) return;
+        long mtime;
+        try {
+            mtime = Files.getLastModifiedTime(path).toMillis();
+        } catch (Throwable t) {
+            return; // файл недоступен — работаем на текущем конфиге
+        }
+        if (mtime == configLoadedMtime) return;
+        synchronized (this) {
+            try {
+                if (Files.getLastModifiedTime(path).toMillis() == configLoadedMtime) return;
+            } catch (Throwable t) {
+                return;
+            }
+            try {
+                reloadConfig();
+                logger.info("[ModsSite] Config file changed on disk — reloaded automatically");
+            } catch (Throwable t) {
+                logger.error("[ModsSite] Cannot reload changed config — keeping previous", t);
+                configLoadedMtime = mtime; // не повторять ошибку на каждом запросе
+            }
         }
     }
 
@@ -323,9 +384,11 @@ public class ModsSiteModule extends LauncherModule {
         updates.updateConfig(config);
         modpacks.updateConfig(config);
         imports.updateConfig(config);
+        backups.updateConfig(config);
         modrinthProvider.clearCache();
         curseforgeProvider.clearCache();
         logger.info("[ModsSite] config reloaded");
+        recordConfigMtime();
     }
 
     public void close(ClosePhase phase) {
@@ -340,6 +403,9 @@ public class ModsSiteModule extends LauncherModule {
         }
         if (imports != null) {
             imports.shutdown();
+        }
+        if (backups != null) {
+            backups.shutdown();
         }
     }
 }

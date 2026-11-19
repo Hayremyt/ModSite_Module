@@ -112,7 +112,8 @@ public class AuthService {
         if (!passwordOk) {
             return AuthResult.of(AuthResult.Status.WRONG_CREDENTIALS);
         }
-        String role = "admin".equalsIgnoreCase(account.role) ? "admin" : "viewer";
+        boolean superAdmin = isSuperAdmin(account.login);
+        String role = "admin".equalsIgnoreCase(account.role) || superAdmin ? "admin" : "viewer";
         // TOTP для локальных аккаунтов
         if (config.auth.totpEnabled && account.totpSecret != null && !account.totpSecret.isBlank()) {
             if (totpCode == null || totpCode.isBlank()) {
@@ -155,8 +156,9 @@ public class AuthService {
                 return AuthResult.of(AuthResult.Status.WRONG_CREDENTIALS);
             }
         }
-        String role = check.admin ? "admin" : "viewer";
-        if ("deny".equalsIgnoreCase(config.launcherAuth.treatNonAdminAs) && !check.admin) {
+        boolean superAdmin = isSuperAdmin(login);
+        String role = check.admin || superAdmin ? "admin" : "viewer";
+        if ("deny".equalsIgnoreCase(config.launcherAuth.treatNonAdminAs) && !check.admin && !superAdmin) {
             return AuthResult.of(AuthResult.Status.NOT_ADMIN);
         }
         // Опциональный TOTP для аккаунтов лаунчера (extraTotp)
@@ -185,6 +187,20 @@ public class AuthService {
             }
         }
         return null;
+    }
+
+    /** Суперадмин задан вручную в config.superAdmins — действует независимо
+     *  от источника аккаунта (локальная запись или БД лаунчера), без учёта регистра. */
+    private boolean isSuperAdmin(String login) {
+        String lower = login == null ? null : login.trim().toLowerCase(java.util.Locale.ROOT);
+        if (lower == null || lower.isEmpty() || config.superAdmins == null) {
+            return false;
+        }
+        for (String candidate : config.superAdmins) {
+            if (candidate == null) continue;
+            if (candidate.trim().toLowerCase(java.util.Locale.ROOT).equals(lower)) return true;
+        }
+        return false;
     }
 
     /** Утилита сравнения строк постоянным временем. */

@@ -293,64 +293,79 @@ public class ModrinthApiProvider extends ModsApiProvider {
         }
         List<RemoteVersionInfo> result = new ArrayList<>();
         for (JsonElement element : httpGetJson(url.toString(), headers()).getAsJsonArray()) {
-            JsonObject object = element.getAsJsonObject();
-            RemoteVersionInfo version = new RemoteVersionInfo();
-            version.source = id();
-            version.projectId = projectId;
-            version.versionId = optString(object, "id");
-            version.versionNumber = optString(object, "version_number");
-            version.releaseType = "release".equals(optString(object, "version_type"))
-                    ? "release" : optString(object, "version_type");
-            version.datePublished = 0;
-            String date = optString(object, "date_published");
-            if (date != null) {
-                try {
-                    version.datePublished = java.time.Instant.parse(date).toEpochMilli();
-                } catch (Exception ignored) {
-                }
-            }
-            version.gameVersions = stringList(object.get("game_versions"));
-            version.loaders = stringList(object.get("loaders"));
-            JsonArray depArray = object.getAsJsonArray("dependencies");
-            if (depArray != null) {
-                for (JsonElement dep : depArray) {
-                    JsonObject depObject = dep.getAsJsonObject();
-                    String type = optString(depObject, "dependency_type");
-                    String pid = optString(depObject, "project_id");
-                    if (pid != null && type != null) {
-                        version.dependencies.add(new RemoteVersionInfo.RemoteDependency(id(), pid, type));
-                    }
-                }
-            }
-            JsonArray files = object.getAsJsonArray("files");
-            JsonObject primary = null;
-            if (files != null) {
-                for (JsonElement f : files) {
-                    JsonObject file = f.getAsJsonObject();
-                    if (file.has("primary") && !file.get("primary").isJsonNull()
-                            && file.get("primary").getAsBoolean()) {
-                        primary = file;
-                        break;
-                    }
-                }
-            }
-            if (primary == null && files != null && files.size() > 0) {
-                primary = files.get(0).getAsJsonObject();
-            }
-            if (primary != null) {
-                version.fileName = optString(primary, "filename");
-                version.url = optString(primary, "url");
-                version.size = optLong(primary, "size", 0);
-                JsonObject hashes = optObject(primary, "hashes");
-                if (hashes != null) {
-                    version.sha512 = optString(hashes, "sha512");
-                    version.sha1 = optString(hashes, "sha1");
-                }
-            }
-            if (version.url != null) {
+            RemoteVersionInfo version = parseVersion(element.getAsJsonObject(), projectId);
+            if (version != null && version.url != null) {
                 result.add(version);
             }
         }
         return result;
+    }
+
+    /** GET /version/{id} — точная версия по ID (восстановление бекапов). */
+    @Override
+    public RemoteVersionInfo versionById(String versionId) throws Exception {
+        if (versionId == null || versionId.isBlank()) return null;
+        JsonObject object = httpGetJson(baseUrl() + "/version/" + urlEncode(versionId), headers()).getAsJsonObject();
+        if (object == null) return null;
+        return parseVersion(object, optString(object, "project_id"));
+    }
+
+    /** Разбор объекта версии Modrinth (общий для /project/{id}/version и /version/{id}). */
+    private RemoteVersionInfo parseVersion(JsonObject object, String projectId) {
+        if (object == null) return null;
+        RemoteVersionInfo version = new RemoteVersionInfo();
+        version.source = id();
+        version.projectId = projectId;
+        version.versionId = optString(object, "id");
+        version.versionNumber = optString(object, "version_number");
+        version.releaseType = "release".equals(optString(object, "version_type"))
+                ? "release" : optString(object, "version_type");
+        version.datePublished = 0;
+        String date = optString(object, "date_published");
+        if (date != null) {
+            try {
+                version.datePublished = java.time.Instant.parse(date).toEpochMilli();
+            } catch (Exception ignored) {
+            }
+        }
+        version.gameVersions = stringList(object.get("game_versions"));
+        version.loaders = stringList(object.get("loaders"));
+        JsonArray depArray = object.getAsJsonArray("dependencies");
+        if (depArray != null) {
+            for (JsonElement dep : depArray) {
+                JsonObject depObject = dep.getAsJsonObject();
+                String type = optString(depObject, "dependency_type");
+                String pid = optString(depObject, "project_id");
+                if (pid != null && type != null) {
+                    version.dependencies.add(new RemoteVersionInfo.RemoteDependency(id(), pid, type));
+                }
+            }
+        }
+        JsonArray files = object.getAsJsonArray("files");
+        JsonObject primary = null;
+        if (files != null) {
+            for (JsonElement f : files) {
+                JsonObject file = f.getAsJsonObject();
+                if (file.has("primary") && !file.get("primary").isJsonNull()
+                        && file.get("primary").getAsBoolean()) {
+                    primary = file;
+                    break;
+                }
+            }
+        }
+        if (primary == null && files != null && files.size() > 0) {
+            primary = files.get(0).getAsJsonObject();
+        }
+        if (primary != null) {
+            version.fileName = optString(primary, "filename");
+            version.url = optString(primary, "url");
+            version.size = optLong(primary, "size", 0);
+            JsonObject hashes = optObject(primary, "hashes");
+            if (hashes != null) {
+                version.sha512 = optString(hashes, "sha512");
+                version.sha1 = optString(hashes, "sha1");
+            }
+        }
+        return version;
     }
 }

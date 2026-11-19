@@ -17,6 +17,13 @@ public class Modpack {
     public String resourcepacksDir = "";
     /** Переопределение поддиректории шейдеров ("" — mods.shadersSubdir). */
     public String shaderpacksDir = "";
+    /**
+     * Папки, попадающие в бекап профиля (относительно папки профиля в
+     * updates/). Выбираются галочками во вкладке «Бекапы» из папок сборки.
+     * Пусто — три стандартные папки контента (mods/ resourcepacks/
+     * shaderpacks с учётом переопределений).
+     */
+    public List<String> backupFolders = new ArrayList<>();
     public List<ModEntry> mods = new ArrayList<>();
 
     public ModEntry find(String id) {

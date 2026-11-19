@@ -4,6 +4,7 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import pro.gravit.launcher.base.profiles.ClientProfile;
 import pro.gravit.launchermodules.modssite.ModsSiteConfig;
+import pro.gravit.launchermodules.modssite.security.AuditLogger;
 import pro.gravit.utils.helper.IOHelper;
 import pro.gravit.utils.helper.SecurityHelper;
 
@@ -25,6 +26,8 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -43,7 +46,12 @@ public class UpdateService {
     private final ModrinthApiProvider modrinth;
     private final CurseForgeApiProvider curseforge;
     private final HttpClient downloadClient;
-    private final ExecutorService executor;
+    /** Пул скачиваний не final: изменение «одновременных скачиваний» в настройках
+     *  пересоздаёт его без перезапуска сервера (старые скачивания дочитываются). */
+    private volatile ExecutorService executor;
+    /** Фактический размер текущего пула (config — общий объект, значение в нём
+     *  может быть уже изменено настройками, поэтому сверяемся с ним). */
+    private volatile int executorSize;
 
     public UpdateService(ModsSiteConfig config, ModrinthApiProvider modrinth, CurseForgeApiProvider curseforge) {
         this.config = config;
@@ -59,6 +67,7 @@ public class UpdateService {
                     thread.setDaemon(true);
                     return thread;
                 });
+        this.executorSize = Math.max(1, config.mods.maxConcurrentDownloads);
     }
 
     public ModsApiProvider provider(String id) {
@@ -96,14 +105,267 @@ public class UpdateService {
         return config.mods.updateSourcePriority.indexOf(sourceId);
     }
 
-    /** mods reload: подменить конфиг (TTL, приоритет источников и т.п.). */
+    /** mods reload: подменить конфиг (TTL, приоритет источников и т.п.);
+     *  лимит одновременных скачиваний применяется сразу. */
     public void updateConfig(ModsSiteConfig newConfig) {
         if (newConfig == null) return;
         this.config = newConfig;
+        syncExecutor();
+    }
+
+    /** Синхронизировать пул скачиваний с config.mods.maxConcurrentDownloads.
+     *  Вызывается после сохранения настроек через сайт и после mods reload:
+     *  конфиг — общий объект, поэтому сверяемся с фактическим размером пула. */
+    public void syncExecutor() {
+        int want = Math.max(1, config.mods.maxConcurrentDownloads);
+        if (want == executorSize) return;
+        ExecutorService old = executor;
+        executor = Executors.newFixedThreadPool(want,
+                r -> {
+                    Thread thread = new Thread(r, "ModsSite-Download");
+                    thread.setDaemon(true);
+                    return thread;
+                });
+        executorSize = want;
+        // shutdown (не shutdownNow): незаконченные скачивания корректно завершаются
+        old.shutdown();
+        logger.info("[ModsSite] download pool resized to {}", want);
     }
 
     public void shutdown() {
         executor.shutdownNow();
+        jobExecutor.shutdownNow();
+    }
+
+    // ======================= Фоновые задачи обновления =======================
+
+    /** Прогресс одного мода в задаче (для интерфейса). */
+    public static class ModProgress {
+        public volatile String id;
+        public volatile String title;
+        /** waiting | checking | downloading | done | skipped | error. */
+        public volatile String status = "waiting";
+        /** Версия, ошибка или пояснение. */
+        public volatile String detail;
+        public volatile long downloaded;
+        /** Content-Length или -1, если источник не отдал размер. */
+        public volatile long totalBytes = -1;
+    }
+
+    /** Статусы мода в задаче: waiting | checking | downloading | done | skipped | cancelled | error. */
+    public static final String ST_CANCELLED = "cancelled";
+
+    /** Приёмник прогресса скачивания (байты); totalBytes = -1 при неизвестном размере. */
+    @FunctionalInterface
+    public interface DownloadProgress {
+        void accept(long downloaded, long totalBytes);
+    }
+
+    /**
+     * Фоновая задача «Обновить всё»/«Применить состав» (1.1.1): HTTP-запрос
+     * возвращается сразу, интерфейс опрашивает /api/mods/progress и видит,
+     * какой мод сейчас качается и сколько байт уже пришло. Раньше запрос
+     * молча висел до конца всех скачиваний — было не понять, работает или зависло.
+     */
+    public static class UpdateJob {
+        public final String type;          // update | apply
+        public final String profileDir;
+        public final long startedAt = System.currentTimeMillis();
+        public volatile long finishedAt;
+        /** preparing | checking | downloading | rehashing | done | error. */
+        public volatile String phase = "preparing";
+        public volatile boolean finished;
+        public volatile boolean ok;
+        public volatile String error;
+        public volatile int total;
+        public volatile int completed;
+        /** Прогресс фазы проверки обновлений (сколько модов проверено). */
+        public volatile int checkDone;
+        public volatile int checkTotal = -1;
+        public volatile boolean rehashed;
+        /** Кнопка «Остановить» нажата: начатое докачивается, очередь отменяется. */
+        public volatile boolean stopRequested;
+        /** Обновление остановлено вручную (часть модов докачана, очередь отменена). */
+        public volatile boolean stopped;
+        public final List<InstallResult> results = new CopyOnWriteArrayList<>();
+        private final ConcurrentHashMap<String, ModProgress> mods = new ConcurrentHashMap<>();
+        private final List<String> order = new CopyOnWriteArrayList<>();
+
+        UpdateJob(String type, String profileDir) {
+            this.type = type;
+            this.profileDir = profileDir;
+        }
+
+        /** Прогресс мода (создаётся при первом обращении; потокобезопасно). */
+        public ModProgress mod(ModEntry entry) {
+            ModProgress mp = mods.get(entry.id);
+            if (mp == null) {
+                ModProgress fresh = new ModProgress();
+                fresh.id = entry.id;
+                fresh.title = entry.name != null && !entry.name.isBlank() ? entry.name : entry.id;
+                ModProgress prev = mods.putIfAbsent(entry.id, fresh);
+                mp = prev != null ? prev : fresh;
+                if (prev == null && !order.contains(entry.id)) order.add(entry.id);
+            }
+            return mp;
+        }
+
+        /** Зафиксировать результат мода (вызывается по завершении скачивания). */
+        public void result(InstallResult result) {
+            results.add(result);
+            completed++;
+            ModProgress mp = result.modId != null ? mods.get(result.modId) : null;
+            if (mp == null) return;
+            if (result.cancelled) {
+                mp.status = ST_CANCELLED;
+                mp.detail = null;
+            } else if (result.error != null) {
+                mp.status = "error";
+                mp.detail = result.error;
+            } else if (result.postponed) {
+                mp.status = "skipped";
+                mp.detail = result.version;
+            } else {
+                mp.status = "done";
+                mp.detail = result.version != null ? result.version : "";
+                if (mp.totalBytes > 0) mp.downloaded = mp.totalBytes;
+            }
+        }
+
+        /** Снимок состояния модов в исходном порядке (для JSON). */
+        public List<ModProgress> snapshot() {
+            List<ModProgress> list = new ArrayList<>();
+            for (String id : order) {
+                ModProgress mp = mods.get(id);
+                if (mp != null) list.add(mp);
+            }
+            return list;
+        }
+
+        /** Кнопка «Остановить»: начатые скачивания дочитываются, ещё не начатые
+         *  получат статус cancelled и из очереди исчезнут. */
+        public void requestStop() {
+            this.stopRequested = true;
+        }
+
+        void finish(boolean ok) {
+            this.ok = ok;
+            this.finished = true;
+            this.finishedAt = System.currentTimeMillis();
+            this.phase = ok ? "done" : "error";
+        }
+    }
+
+    private final ExecutorService jobExecutor = Executors.newCachedThreadPool(r -> {
+        Thread thread = new Thread(r, "ModsSite-UpdateJob");
+        thread.setDaemon(true);
+        return thread;
+    });
+    private final ConcurrentHashMap<String, UpdateJob> activeUpdateJobs = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, UpdateJob> lastUpdateJobs = new ConcurrentHashMap<>();
+
+    /** Активная (незавершённая) задача профиля или null. */
+    public UpdateJob activeUpdateJob(String profileDir) {
+        UpdateJob job = activeUpdateJobs.get(profileDir);
+        return job != null && !job.finished ? job : null;
+    }
+
+    /** Последняя задача профиля: активная, иначе завершённая (для доспрашивания итога). */
+    public UpdateJob lastUpdateJob(String profileDir) {
+        UpdateJob active = activeUpdateJobs.get(profileDir);
+        if (active != null) return active;
+        return lastUpdateJobs.get(profileDir);
+    }
+
+    /**
+     * Запустить фоновое обновление/применение состава. null — на профиле уже
+     * бежит задача (интерфейсу показать её, код update_in_progress).
+     * Вызов после завершённой задачи заменяет её.
+     */
+    public UpdateJob startUpdateJob(String type, ClientProfile profile, ModpackService modpackService,
+                                    Set<String> ids, boolean updateDisabled, boolean apply,
+                                    String ip, String login, AuditLogger audit) {
+        UpdateJob job = new UpdateJob(type, profile.getDir());
+        while (true) {
+            UpdateJob prev = activeUpdateJobs.putIfAbsent(profile.getDir(), job);
+            if (prev == null) break;
+            if (!prev.finished) return null; // уже бежит — вторую не стартуем
+            if (activeUpdateJobs.replace(profile.getDir(), prev, job)) break;
+        }
+        jobExecutor.submit(() -> {
+            try {
+                runUpdateJob(job, profile, modpackService, ids, updateDisabled, apply, ip, login, audit);
+                job.finish(true);
+            } catch (Throwable t) {
+                logger.error("Update job failed", t);
+                job.error = t.getMessage() != null ? t.getMessage() : String.valueOf(t);
+                job.finish(false);
+            } finally {
+                lastUpdateJobs.put(profile.getDir(), job);
+                activeUpdateJobs.remove(profile.getDir(), job);
+            }
+        });
+        return job;
+    }
+
+    /** Тело фоновой задачи: та же последовательность, что раньше выполнялась
+     *  в HTTP-запросе (проверка → скачивание → rehash), но с фазами прогресса. */
+    private void runUpdateJob(UpdateJob job, ClientProfile profile, ModpackService modpackService,
+                              Set<String> ids, boolean updateDisabled, boolean apply,
+                              String ip, String login, AuditLogger audit) throws Exception {
+        var lock = modpackService.lock(profile.getDir());
+        lock.lock();
+        try {
+            Modpack modpack = modpackService.load(profile);
+            List<InstallResult> results;
+            if (apply) {
+                job.phase = "downloading";
+                results = applyComposition(profile, modpack, modpackService, job);
+            } else {
+                for (ModEntry entry : updateCandidates(modpack, ids, updateDisabled)) {
+                    job.mod(entry);
+                }
+                job.phase = "checking";
+                checkUpdates(profile, modpack, modpackService, false, job);
+                job.phase = "downloading";
+                if (job.stopRequested) {
+                    // «Остановить» во время проверки: начатых скачиваний нет,
+                    // всю очередь отменяем — ничего не качаем. Каждый отменённый
+                    // мод фиксируем как результат, чтобы итог был честным.
+                    results = new ArrayList<>();
+                    for (ModProgress mp : job.snapshot()) {
+                        if (!"waiting".equals(mp.status)) continue;
+                        InstallResult cancelled = new InstallResult(mp.id);
+                        cancelled.cancelled = true;
+                        job.result(cancelled);
+                        results.add(cancelled);
+                    }
+                } else {
+                    results = updateMods(profile, modpack, modpackService, ids, updateDisabled, job);
+                }
+            }
+            if (config.mods.autoRehash) {
+                job.phase = "rehashing";
+                try {
+                    modpackService.rehash(profile.getDir());
+                    job.rehashed = true;
+                } catch (Exception e) {
+                    logger.warn("Rehash failed", e);
+                }
+            }
+            try {
+                if (audit != null) {
+                    audit.log("apply".equals(job.type) ? "mods_apply" : "mods_update",
+                            ip, login, profile.getDir(),
+                            Map.of("updated", results.size(), "rehashed", job.rehashed));
+                }
+            } catch (Exception e) {
+                logger.warn("Audit log failed", e);
+            }
+        } finally {
+            lock.unlock();
+        }
+        if (job.stopRequested) job.stopped = true;
     }
 
     // ======================= Выбор версии =======================
@@ -209,6 +471,13 @@ public class UpdateService {
      */
     public CheckSummary checkUpdates(ClientProfile profile, Modpack modpack,
                                       ModpackService modpackService, boolean force) {
+        return checkUpdates(profile, modpack, modpackService, force, null);
+    }
+
+    /** Вариант с прикреплённой задачей прогресса (job != null — считаются
+     *  checkDone/checkTotal для интерфейса). */
+    public CheckSummary checkUpdates(ClientProfile profile, Modpack modpack,
+                                      ModpackService modpackService, boolean force, UpdateJob job) {
         CheckSummary summary = new CheckSummary();
         List<UpdateCheck> results = summary.checks;
         boolean changed = false;
@@ -228,6 +497,7 @@ public class UpdateService {
                 results.add(null); // placeholder, заполним ниже
             }
         }
+        if (job != null) job.checkTotal = toCheck.size();
         if (!toCheck.isEmpty()) {
             // 2. Пакетное сопоставление файлов по хэшам на всех доступных источниках
             HashIndex index = buildHashIndex(profile, modpack, modpackService, toCheck, summary.warnings);
@@ -236,6 +506,12 @@ public class UpdateService {
             for (ModEntry entry : modpack.mods) {
                 if (i >= results.size()) break;
                 if (results.get(i) != null) { i++; continue; }
+                if (job != null && job.stopRequested) {
+                    // «Остановить» во время проверки: остаток очереди не проверяем
+                    results.set(i, null);
+                    i++;
+                    continue;
+                }
                 UpdateCheck check;
                 try {
                     check = resolveUpdate(profile, modpack, modpackService,
@@ -255,6 +531,7 @@ public class UpdateService {
                 if (check.relinked) changed = true;
                 changed |= check.source != null;
                 results.set(i, check);
+                if (job != null) job.checkDone++;
                 i++;
             }
         }
@@ -618,6 +895,8 @@ public class UpdateService {
         public String error;
         /** Обновление пропущено: версия отложена кнопкой «Отложить». */
         public boolean postponed;
+        /** Мод не начал качаться: задача остановлена кнопкой «Остановить». */
+        public boolean cancelled;
 
         InstallResult(String modId) {
             this.modId = modId;
@@ -630,28 +909,52 @@ public class UpdateService {
      */
     public InstallResult install(ClientProfile profile, Modpack modpack,
                                  ModpackService modpackService, ModEntry entry, RemoteVersionInfo version) {
+        return install(profile, modpack, modpackService, entry, version, null);
+    }
+
+    public InstallResult install(ClientProfile profile, Modpack modpack,
+                                 ModpackService modpackService, ModEntry entry, RemoteVersionInfo version,
+                                 UpdateJob job) {
         InstallResult result = new InstallResult(entry.id);
+        ModProgress progress = job != null ? job.mod(entry) : null;
+        Path temp = null;
         try {
             Path dir = modpackService.kindDir(profile, modpack, entry.kindOrMod());
             IOHelper.createParentDirs(dir.resolve("x"));
             String fileName = sanitizeFileName(version.fileName);
             Path target = dir.resolve(fileName);
-            Path temp = dir.resolve(fileName + ".part");
-            downloadToFile(version.url, temp, version);
+            temp = dir.resolve(fileName + ".part");
+            DownloadProgress sink = progress == null ? null
+                    : (downloaded, totalBytes) -> {
+                        progress.downloaded = downloaded;
+                        progress.totalBytes = totalBytes;
+                    };
+            downloadToFile(version.url, temp, version, sink);
             verify(temp, version);
-            // Удаляем СТАРЫЙ файл — имя могло измениться!
-            if (entry.installedFileName != null && !entry.installedFileName.isBlank()
-                    && !entry.installedFileName.equals(fileName)) {
-                Path old = dir.resolve(sanitizeFileName(entry.installedFileName));
-                Files.deleteIfExists(old);
+            // Прежнее имя файла. Сравниваем УЖЕ САНИТИЗИРОВАННЫЕ имена: у старого
+            // имени из метаданных могла быть другая запись (пути/протокол), а на
+            // диске оно совпадает с новым — тогда удалять ничего нельзя (снесли
+            // бы только что установленный файл).
+            String oldName = entry.installedFileName != null && !entry.installedFileName.isBlank()
+                    ? sanitizeFileName(entry.installedFileName) : null;
+            boolean sameName = oldName != null && oldName.equals(fileName);
+            // 1. Сначала новый файл занимает место старого (атомарно, где можно):
+            //    пока move не прошёл, на диске остаётся прежний рабочий мод.
+            moveIntoPlace(temp, target);
+            temp = null; // файла .part больше нет — при ошибке ниже чистить нечего
+            // 2. Только теперь удаляем СТАРЫЙ файл — имя могло измениться!
+            //    Даже если удаление сломается (права/лок), новый мод уже на
+            //    месте: худший исход — лишний старый jar, а не пропавший мод.
+            if (!sameName && oldName != null) {
+                try {
+                    Files.deleteIfExists(dir.resolve(oldName));
+                } catch (IOException e) {
+                    logger.warn("Old file '{}' not removed after update of {}: {}",
+                            oldName, entry.id, String.valueOf(e.getMessage()));
+                }
                 // Запомнить прежнее имя: по нему находится привязка в updateOptional
                 // (в т.ч. ручная запись админа), которую надо перепривязать
                 entry.pushPreviousFileName(entry.installedFileName);
-            }
-            try {
-                Files.move(temp, target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
-            } catch (IOException e) {
-                Files.move(temp, target, StandardCopyOption.REPLACE_EXISTING);
             }
             entry.installedFileName = fileName;
             entry.installedVersionId = version.versionId;
@@ -659,8 +962,15 @@ public class UpdateService {
             entry.installedSha1 = version.sha1;
             entry.installedAt = System.currentTimeMillis();
             // Метаданные мода из jar: modId используется как запасное имя записи
-            // updateOptional (когда сервис не дал slug), имя — в описании записи
-            ModJarInfo.ModMeta meta = ModJarInfo.read(target);
+            // updateOptional (когда сервис не дал slug), имя — в описании записи.
+            // Файл уже установлен — сбой чтения метаданных не может «сломать
+            // обновление», потому читаем со своей защитой.
+            ModJarInfo.ModMeta meta = null;
+            try {
+                meta = ModJarInfo.read(target);
+            } catch (Throwable t) {
+                logger.warn("Jar metadata read failed for {}: {}", fileName, String.valueOf(t.getMessage()));
+            }
             entry.installedModId = meta != null ? meta.id : null;
             entry.installedModName = meta != null ? meta.name : null;
             result.success = true;
@@ -669,8 +979,65 @@ public class UpdateService {
         } catch (Exception e) {
             logger.error("Install failed for {}", entry.id, e);
             result.error = String.valueOf(e.getMessage());
+            // Недокачанный/непроверенный .part не нужен: старый мод остаётся
+            // на диске нетронутым, при следующей попытке начнём заново.
+            if (temp != null) {
+                try {
+                    Files.deleteIfExists(temp);
+                } catch (IOException ignored) {
+                }
+            }
         }
         return result;
+    }
+
+    /**
+     * Подменить {@code target} свежескачанным {@code temp}.
+     * <p>Основной путь — атомарный rename: файл заменяется целиком или не
+     * трогается вовсе, «половинного» jar на диске не бывает. Если атомарный
+     * rename не поддержан файловой системой — резервный путь: перед заменой
+     * сохраняем копию старого файла и восстанавливаем её при сбое.
+     * temp и target всегда в одном каталоге, поэтому rename обычно возможен.
+     */
+    private static void moveIntoPlace(Path temp, Path target) throws IOException {
+        try {
+            Files.move(temp, target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+            return;
+        } catch (java.nio.file.AtomicMoveNotSupportedException e) {
+            // атомарность не поддержана — идём через страховочную копию
+        } catch (IOException e) {
+            // сбой атомарной замены — идём через страховочную копию
+        }
+        Path backup = null;
+        if (Files.exists(target)) {
+            backup = target.resolveSibling(
+                    target.getFileName() + ".bak-" + Long.toHexString(System.nanoTime()));
+            try {
+                Files.copy(target, backup, StandardCopyOption.REPLACE_EXISTING);
+            } catch (IOException copyFailed) {
+                backup = null; // без копии, но замена всё равно попытается пройти
+            }
+        }
+        try {
+            Files.move(temp, target, StandardCopyOption.REPLACE_EXISTING);
+        } catch (IOException e) {
+            if (backup != null) {
+                try {
+                    Files.copy(backup, target, StandardCopyOption.REPLACE_EXISTING);
+                } catch (IOException restoreFailed) {
+                    logger.error("Could not restore backup of {} after failed move",
+                            target.getFileName(), restoreFailed);
+                }
+            }
+            throw e;
+        } finally {
+            if (backup != null) {
+                try {
+                    Files.deleteIfExists(backup);
+                } catch (IOException ignored) {
+                }
+            }
+        }
     }
 
     /**
@@ -683,24 +1050,66 @@ public class UpdateService {
     public List<InstallResult> updateMods(ClientProfile profile, Modpack modpack,
                                           ModpackService modpackService, Set<String> ids,
                                           boolean updateDisabled) throws Exception {
-        String gameVersion = modpackService.gameVersion(profile, modpack);
-        String loader = modpackService.loader(profile, modpack);
-        List<Future<InstallResult>> futures = new ArrayList<>();
+        return updateMods(profile, modpack, modpackService, ids, updateDisabled, null);
+    }
+
+    /** Моды, попадающие под обновление (для предзаполнения прогресса).
+     *  «Обновить всё» (ids == null) обновляет ТОЛЬКО то, что нашла проверка
+     *  обновлений (isUpdateAvailable) — без повторного перекачивания модов,
+     *  у которых версия уже актуальна. Конкретный список (ids != null) и
+     *  «Применить состав» (apply) работают по явному списку. */
+    public static List<ModEntry> updateCandidates(Modpack modpack, Set<String> ids, boolean updateDisabled) {
         List<ModEntry> toProcess = new ArrayList<>();
         for (ModEntry entry : modpack.mods) {
-            boolean targeted = ids == null || ids.contains(entry.id);
-            if (!targeted) continue;
+            if (ids == null) {
+                if (!entry.isUpdateAvailable()) continue;
+            } else if (!ids.contains(entry.id)) {
+                continue;
+            }
             boolean isDisabledOptional = entry.optional && !entry.enabled;
             if (isDisabledOptional && !updateDisabled) continue;
             toProcess.add(entry);
         }
+        return toProcess;
+    }
+
+    public List<InstallResult> updateMods(ClientProfile profile, Modpack modpack,
+                                          ModpackService modpackService, Set<String> ids,
+                                          boolean updateDisabled, UpdateJob job) throws Exception {
+        String gameVersion = modpackService.gameVersion(profile, modpack);
+        String loader = modpackService.loader(profile, modpack);
+        List<Future<InstallResult>> futures = new ArrayList<>();
+        List<ModEntry> toProcess = updateCandidates(modpack, ids, updateDisabled);
+        if (job != null) {
+            job.total = toProcess.size();
+            for (ModEntry entry : toProcess) job.mod(entry);
+        }
         for (ModEntry entry : toProcess) {
             futures.add(executor.submit(() -> installOrUpdate(profile, modpack, modpackService,
-                    entry, gameVersion, loader)));
+                    entry, gameVersion, loader, job)));
         }
+        // Сбор результатов: сбой ОДНОЙ задачи (например, таймаут долгого
+        // скачивания) не должен терять результаты остальных — каждый future
+        // собираем со своей защитой, а зависшую отменяем.
         List<InstallResult> results = new ArrayList<>();
-        for (Future<InstallResult> future : futures) {
-            results.add(future.get(10, TimeUnit.MINUTES));
+        for (int i = 0; i < futures.size(); i++) {
+            InstallResult result;
+            try {
+                result = futures.get(i).get(10, TimeUnit.MINUTES);
+            } catch (java.util.concurrent.TimeoutException e) {
+                futures.get(i).cancel(true);
+                result = new InstallResult(
+                        i < toProcess.size() ? toProcess.get(i).id : "?");
+                result.error = "update timed out (10 min limit)";
+                logger.error("Update task timed out for {}", result.modId);
+            } catch (Exception e) {
+                result = new InstallResult(
+                        i < toProcess.size() ? toProcess.get(i).id : "?");
+                result.error = "update task failed: " + String.valueOf(e.getMessage());
+                logger.error("Update task failed", e);
+            }
+            if (job != null) job.result(result);
+            results.add(result);
         }
         // Привязка updateOptional могла протухнуть: имена файлов изменились.
         // Синхронизируем ДО rehash и сохранения модпака.
@@ -712,9 +1121,19 @@ public class UpdateService {
     /** Установить/обновить один мод: приоритет источников + учёт «Отложить». */
     private InstallResult installOrUpdate(ClientProfile profile, Modpack modpack,
                                           ModpackService modpackService, ModEntry entry,
-                                          String gameVersion, String loader) {
+                                          String gameVersion, String loader, UpdateJob job) {
         InstallResult result = new InstallResult(entry.id);
+        // Задача остановлена: ещё не начатые скачивания из очереди убираем.
+        // Уже начатое скачивание проходит эту проверку один раз — оно докачивается.
+        if (job != null && job.stopRequested) {
+            ModProgress progress = job.mod(entry);
+            progress.status = ST_CANCELLED;
+            result.cancelled = true;
+            return result;
+        }
+        ModProgress progress = job != null ? job.mod(entry) : null;
         try {
+            if (progress != null) progress.status = "checking";
             Path dir = modpackService.kindDir(profile, modpack, entry.kindOrMod());
             boolean fileExists = entry.installedFileName != null && !entry.installedFileName.isBlank()
                     && Files.isRegularFile(dir.resolve(sanitizeFileName(entry.installedFileName)));
@@ -755,7 +1174,11 @@ public class UpdateService {
                 return result;
             }
             RemoteVersionInfo version = latestAsVersion(entry);
-            return install(profile, modpack, modpackService, entry, version);
+            if (progress != null) {
+                progress.status = "downloading";
+                if (version.versionNumber != null) progress.detail = version.versionNumber;
+            }
+            return install(profile, modpack, modpackService, entry, version, job);
         } catch (Exception e) {
             logger.error("Update failed for {}", entry.id, e);
             result.error = String.valueOf(e.getMessage());
@@ -786,6 +1209,11 @@ public class UpdateService {
      */
     public List<InstallResult> applyComposition(ClientProfile profile, Modpack modpack,
                                                  ModpackService modpackService) throws Exception {
+        return applyComposition(profile, modpack, modpackService, null);
+    }
+
+    public List<InstallResult> applyComposition(ClientProfile profile, Modpack modpack,
+                                                 ModpackService modpackService, UpdateJob job) throws Exception {
         // Все записи входят в состав: доставить недостающие файлы
         List<ModEntry> toInstall = new ArrayList<>();
         for (ModEntry entry : modpack.mods) {
@@ -800,10 +1228,14 @@ public class UpdateService {
                 toInstall.add(entry);
             }
         }
+        if (job != null) {
+            job.total = toInstall.size();
+            for (ModEntry entry : toInstall) job.mod(entry);
+        }
         Set<String> ids = new HashSet<>();
         for (ModEntry entry : toInstall) ids.add(entry.id);
         List<InstallResult> results = ids.isEmpty() ? new ArrayList<>()
-                : updateMods(profile, modpack, modpackService, ids, true);
+                : updateMods(profile, modpack, modpackService, ids, true, job);
         // Согласовать updateOptional с составом (в т.ч. записи бывших
         // «выключенных» из старых версий — теперь они тоже в составе) до rehash.
         modpackService.optionalSync().reconcile(profile, modpack);
@@ -821,7 +1253,12 @@ public class UpdateService {
      */
     private static final long MAX_DOWNLOAD_BYTES = 512L * 1024 * 1024;
 
-    private void downloadToFile(String url, Path target, RemoteVersionInfo version) throws Exception {
+    void downloadToFile(String url, Path target, RemoteVersionInfo version) throws Exception {
+        downloadToFile(url, target, version, null);
+    }
+
+    void downloadToFile(String url, Path target, RemoteVersionInfo version,
+                        DownloadProgress progress) throws Exception {
         HttpRequest.Builder builder = HttpRequest.newBuilder()
                 .uri(new URI(url))
                 .timeout(Duration.ofSeconds(Math.max(10, config.mods.httpTimeoutSeconds)))
@@ -834,10 +1271,13 @@ public class UpdateService {
         if (response.statusCode() < 200 || response.statusCode() >= 300) {
             throw new IOException("Download failed: HTTP " + response.statusCode());
         }
+        // Размер из Content-Length: -1, если источник его не отдал
+        long contentLength = response.headers().firstValueAsLong("content-length").orElse(-1L);
         try (InputStream input = response.body()) {
             IOHelper.createParentDirs(target);
             Files.deleteIfExists(target);
             long total = 0;
+            long lastReport = System.nanoTime();
             try (java.io.OutputStream output = Files.newOutputStream(target)) {
                 byte[] buffer = new byte[8192];
                 int read;
@@ -848,6 +1288,11 @@ public class UpdateService {
                                 + (MAX_DOWNLOAD_BYTES / (1024 * 1024)) + " MB (" + target.getFileName() + ")");
                     }
                     output.write(buffer, 0, read);
+                    // Прогресс — не чаще ~10 раз в секунду, чтобы не шуметь
+                    if (progress != null && System.nanoTime() - lastReport > 100_000_000L) {
+                        progress.accept(total, contentLength);
+                        lastReport = System.nanoTime();
+                    }
                 }
             } catch (Exception e) {
                 // Не оставлять недокачанный файл: на следующей попытке начнём заново
@@ -857,10 +1302,11 @@ public class UpdateService {
                 }
                 throw e;
             }
+            if (progress != null) progress.accept(total, contentLength);
         }
     }
 
-    private void verify(Path file, RemoteVersionInfo version) throws IOException {
+    void verify(Path file, RemoteVersionInfo version) throws IOException {
         if (!config.mods.verifyHash) return;
         if (version.sha512 != null && !version.sha512.isBlank()) {
             String actual = hashFile(file, "SHA-512");
@@ -877,7 +1323,7 @@ public class UpdateService {
         }
     }
 
-    private static String hashFile(Path file, String algorithm) throws IOException {
+    static String hashFile(Path file, String algorithm) throws IOException {
         try (InputStream input = Files.newInputStream(file)) {
             MessageDigest digest = MessageDigest.getInstance(algorithm);
             byte[] buffer = new byte[8192];

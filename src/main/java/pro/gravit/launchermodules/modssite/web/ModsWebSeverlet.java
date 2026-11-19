@@ -19,8 +19,10 @@ import pro.gravit.launchermodules.modssite.ModsSiteLogLevels;
 import pro.gravit.launchermodules.modssite.ModsSiteModule;
 import pro.gravit.launchermodules.modssite.Utils;
 import pro.gravit.launchermodules.modssite.auth.AuthService;
+import pro.gravit.launchermodules.modssite.auth.RoleResolver;
 import pro.gravit.launchermodules.modssite.auth.SessionManager;
 import pro.gravit.launchermodules.modssite.mods.ModEntry;
+import pro.gravit.launchermodules.modssite.mods.BackupService;
 import pro.gravit.launchermodules.modssite.mods.ImportService;
 import pro.gravit.launchermodules.modssite.mods.Kinds;
 import pro.gravit.launchermodules.modssite.mods.Modpack;
@@ -45,6 +47,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * HTTP-фронтенд модуля: статика веб-интерфейса + JSON API.
@@ -87,6 +90,7 @@ public class ModsWebSeverlet implements NettyWebAPIHandler.SimpleSeverletHandler
     }
 
     private boolean trustProxy() {
+        if (config() == null || config().web == null) return false;
         String mode = config().web.trustProxyHeaders;
         if ("true".equalsIgnoreCase(mode)) return true;
         if ("false".equalsIgnoreCase(mode)) return false;
@@ -95,22 +99,83 @@ public class ModsWebSeverlet implements NettyWebAPIHandler.SimpleSeverletHandler
                 && module.server.config.netty.ipForwarding;
     }
 
+    /** Редкий лог «хост не совпал»: не чаще раза в минуту на хост (защита от
+     *  спама сканерами, долбящими "/" со случайными Host). */
+    private static final Map<String, Long> HOST_MISMATCH_LOGGED = new ConcurrentHashMap<>();
+    private static final long HOST_MISMATCH_LOG_INTERVAL_MS = 60_000L;
+
+    /** Запрос похож на сайт ("/" или статика), но Host не входит в web.siteDomains:
+     *  скорее всего, прокси подменяет Host или домен не добавлен в настройки.
+     *  Один WARN в минуту на хост с подсказкой — без него «поддомен не работает»
+     *  невозможно диагностировать по логам сервера. */
+    private void logHostMismatch(FullHttpRequest msg, boolean domainsConfigured) {
+        if (!domainsConfigured) return; // root-режим выключен — это не проблема конфигурации
+        String host = msg.headers().get(HttpHeaderNames.HOST);
+        if (host == null || host.isBlank()) host = "<none>";
+        String key = host.length() > 128 ? host.substring(0, 128) : host;
+        long now = System.currentTimeMillis();
+        Long last = HOST_MISMATCH_LOGGED.put(key, now);
+        if (last != null && now - last < HOST_MISMATCH_LOG_INTERVAL_MS) return;
+        if (HOST_MISMATCH_LOGGED.size() > 64) HOST_MISMATCH_LOGGED.clear();
+        String forwarded = trustProxy()
+                ? msg.headers().get("X-Forwarded-Host") : null;
+        // Показать настроенные домены прямо в логе: без этого админ не видит,
+        // что именно вписано в siteDomains, и добавляет «не тот» домен.
+        List<String> configured = config() == null || config().web == null
+                ? null : config().web.siteDomains;
+        StringBuilder shown = new StringBuilder();
+        if (configured != null) {
+            for (int i = 0; i < configured.size() && i < 8; i++) {
+                if (i > 0) shown.append(", ");
+                shown.append("'").append(configured.get(i)).append("'");
+            }
+            if (configured.size() > 8) shown.append(", ... (").append(configured.size()).append(" total)");
+        }
+        if (shown.length() == 0) shown.append("<empty>");
+        logger.warn("[ModsSite] Site path '{}' requested with Host '{}' — not in web.siteDomains ({}); "
+                        + "site is NOT served on this host. Add the exact domain (e.g. 'mods.example.com') "
+                        + "or a wildcard ('*.example.com' = any subdomain) in admin Settings -> Site domains. "
+                        + "Behind nginx also add 'proxy_set_header Host $host;' "
+                        + "and 'proxy_set_header X-Forwarded-Host $host;'{}",
+                msg.uri(), host, shown,
+                forwarded != null && !forwarded.isBlank()
+                        ? " (X-Forwarded-Host: '" + forwarded + "')" : "");
+    }
+
     @Override
     public void handle(ChannelHandlerContext ctx, FullHttpRequest msg, NettyConnectContext context) {
         // Корневая точка монтирования: сайт в корне отдаём ТОЛЬКО
-        // 1) хостам из web.siteDomains (заголовок Host, порт не учитывается) и
+        // 1) хостам из web.siteDomains (заголовок Host, порт не учитывается;
+        //    за доверенным прокси — ещё X-Forwarded-Host: nginx по умолчанию
+        //    подменяет Host на адрес проксируемого сервера, из-за чего поддомен
+        //    «работал на localhost, но не работает на реальном домене») и
         // 2) только путям самого сайта ("/", "/index.html", статика из
         //    белого списка имён) — все прочие пути (файлы профилей, /api,
         //    любые другие) передаём дальше по конвейеру нетронутыми:
         //    file-сервер и websocket лаунчера работают как раньше, в том
         //    числе если домен сайта совпадает с адресом лаунчера.
-        if (rootGate && (!ModsSiteConfig.siteDomainMatches(
-                config() == null || config().web == null ? null : config().web.siteDomains,
-                msg.headers().get(HttpHeaderNames.HOST))
-                || !isSiteRootPath(msg.uri()))) {
-            msg.retain();
-            ctx.fireChannelRead(msg);
-            return;
+        if (rootGate) {
+            List<String> domains = config() == null || config().web == null
+                    ? null : config().web.siteDomains;
+            boolean hostMatched = ModsSiteConfig.siteDomainMatches(domains,
+                    msg.headers().get(HttpHeaderNames.HOST));
+            if (!hostMatched && trustProxy()) {
+                String forwarded = msg.headers().get("X-Forwarded-Host");
+                if (forwarded != null && !forwarded.isBlank()) {
+                    // список через запятую — берём первый (клиентский) хост
+                    hostMatched = ModsSiteConfig.siteDomainMatches(
+                            domains, forwarded.split(",")[0].trim());
+                }
+            }
+            boolean sitePath = isSiteRootPath(msg.uri());
+            if (!hostMatched || !sitePath) {
+                if (!hostMatched && sitePath) {
+                    logHostMismatch(msg, domains != null && !domains.isEmpty());
+                }
+                msg.retain();
+                ctx.fireChannelRead(msg);
+                return;
+            }
         }
         WebRequest req = new WebRequest(ctx, msg, context, rootGate ? "" : module.mountPath, trustProxy());
         try {
@@ -122,6 +187,10 @@ public class ModsWebSeverlet implements NettyWebAPIHandler.SimpleSeverletHandler
     }
 
     private void handle0(WebRequest req) {
+        // Живая перечитка конфига: если файл Config.json изменился на диске
+        // (админ правит вручную), новые аккаунты/роли/суперадмины/домены
+        // подхватываются уже на этом запросе, без «mods reload».
+        module.ensureFreshConfig();
         if (!module.enabled || !config().enabled) {
             // Сайт выключен командой mods site off: браузеру — человекочитаемая
             // страница, API — JSON (иначе клиенты сайта получали бы сырой JSON)
@@ -362,6 +431,14 @@ public class ModsWebSeverlet implements NettyWebAPIHandler.SimpleSeverletHandler
                 if (isPost) withSession(req, true, true, (session) -> handleUpdateMods(req, ip, session));
                 else sendJson(req, HttpResponseStatus.METHOD_NOT_ALLOWED, error("method", "POST only"));
             }
+            case "/api/mods/update/stop" -> {
+                if (isPost) withSession(req, true, true, (session) -> handleUpdateStop(req, ip, session));
+                else sendJson(req, HttpResponseStatus.METHOD_NOT_ALLOWED, error("method", "POST only"));
+            }
+            case "/api/mods/progress" -> {
+                if (!isPost) withSession(req, true, false, (session) -> handleUpdateProgress(req));
+                else sendJson(req, HttpResponseStatus.METHOD_NOT_ALLOWED, error("method", "GET only"));
+            }
             case "/api/mods/add" -> {
                 if (isPost) withSession(req, true, true, (session) -> handleAdd(req, ip, session));
                 else sendJson(req, HttpResponseStatus.METHOD_NOT_ALLOWED, error("method", "POST only"));
@@ -434,6 +511,46 @@ public class ModsWebSeverlet implements NettyWebAPIHandler.SimpleSeverletHandler
                 if (isPost) withSession(req, true, true, (session) -> handleUserPassword(req, ip, session));
                 else sendJson(req, HttpResponseStatus.METHOD_NOT_ALLOWED, error("method", "POST only"));
             }
+            case "/api/admins" -> {
+                if (!isPost) withSession(req, true, false, (session) -> handleAdminsList(req, session));
+                else sendJson(req, HttpResponseStatus.METHOD_NOT_ALLOWED, error("method", "GET only"));
+            }
+            case "/api/admins/override" -> {
+                if (isPost) withSession(req, true, true, (session) -> handleAdminOverride(req, ip, session));
+                else sendJson(req, HttpResponseStatus.METHOD_NOT_ALLOWED, error("method", "POST only"));
+            }
+            case "/api/backups" -> {
+                if (!isPost) withSession(req, true, false, (session) -> handleBackupsList(req));
+                else sendJson(req, HttpResponseStatus.METHOD_NOT_ALLOWED, error("method", "GET only"));
+            }
+            case "/api/backups/create" -> {
+                if (isPost) withSession(req, true, true, (session) -> handleBackupCreate(req, ip, session));
+                else sendJson(req, HttpResponseStatus.METHOD_NOT_ALLOWED, error("method", "POST only"));
+            }
+            case "/api/backups/rename" -> {
+                if (isPost) withSession(req, true, true, (session) -> handleBackupRename(req, ip, session));
+                else sendJson(req, HttpResponseStatus.METHOD_NOT_ALLOWED, error("method", "POST only"));
+            }
+            case "/api/backups/freeze" -> {
+                if (isPost) withSession(req, true, true, (session) -> handleBackupFreeze(req, ip, session));
+                else sendJson(req, HttpResponseStatus.METHOD_NOT_ALLOWED, error("method", "POST only"));
+            }
+            case "/api/backups/delete" -> {
+                if (isPost) withSession(req, true, true, (session) -> handleBackupDelete(req, ip, session));
+                else sendJson(req, HttpResponseStatus.METHOD_NOT_ALLOWED, error("method", "POST only"));
+            }
+            case "/api/backups/restore" -> {
+                if (isPost) withSession(req, true, true, (session) -> handleBackupRestore(req, ip, session));
+                else sendJson(req, HttpResponseStatus.METHOD_NOT_ALLOWED, error("method", "POST only"));
+            }
+            case "/api/backups/folders" -> {
+                if (isPost) withSession(req, true, true, (session) -> handleBackupFolders(req, ip, session));
+                else sendJson(req, HttpResponseStatus.METHOD_NOT_ALLOWED, error("method", "POST only"));
+            }
+            case "/api/backups/download" -> {
+                if (!isPost) withSession(req, true, false, (session) -> handleBackupDownload(req, ip, session));
+                else sendJson(req, HttpResponseStatus.METHOD_NOT_ALLOWED, error("method", "GET only"));
+            }
             default -> sendJson(req, HttpResponseStatus.NOT_FOUND, error("not_found", "Unknown endpoint"));
         }
     }
@@ -458,7 +575,11 @@ public class ModsWebSeverlet implements NettyWebAPIHandler.SimpleSeverletHandler
             sendJson(req, HttpResponseStatus.UNAUTHORIZED, error("unauthorized", "Not authorized"));
             return;
         }
-        if (requireAdmin && !"admin".equals(session.role)) {
+        // Живая роль: признак админа пересчитывается на каждом запросе.
+        // Назначили админа в БД или в конфиге (или сняли) — результат виден
+        // сразу, без повторного входа; суперадмин/«наблюдатель» тоже здесь.
+        module.roleResolver.refresh(session);
+        if (requireAdmin && !RoleResolver.isAdminRole(session.role)) {
             sendJson(req, HttpResponseStatus.FORBIDDEN, error("forbidden", "Admin role required"));
             return;
         }
@@ -480,6 +601,16 @@ public class ModsWebSeverlet implements NettyWebAPIHandler.SimpleSeverletHandler
     private SessionManager.Session session(WebRequest req) {
         String cookie = req.cookies().get(config().auth.cookieName);
         return cookie == null ? null : module.sessions.get(cookie);
+    }
+
+    /** 409, если на профиле бежит фоновая задача обновления: её поток держит
+     *  лок профиля до самого конца, и запрос ждал бы его молча. Интерфейс
+     *  покажет понятную ошибку вместо «зависшего» запроса. */
+    private boolean updateJobBusy(WebRequest req, ClientProfile profile) {
+        if (module.updates.activeUpdateJob(profile.getDir()) == null) return false;
+        sendJson(req, HttpResponseStatus.CONFLICT, error("update_in_progress",
+                "Update is already running for this profile — wait or watch its progress"));
+        return true;
     }
 
     private void handleLogin(WebRequest req, String ip) {
@@ -508,7 +639,10 @@ public class ModsWebSeverlet implements NettyWebAPIHandler.SimpleSeverletHandler
                 StringBuilder token = new StringBuilder();
                 SessionManager.Session session = module.sessions.create(
                         result.login, result.source, result.role, ip, token);
-                module.audit.log("login_success", ip, result.login, result.source + "/" + result.role);
+                // Живая роль сразу после входа: суперадмин/оверрайд «наблюдатель»
+                // применяется к ответу уже здесь, а не со следующего запроса.
+                module.roleResolver.refresh(session);
+                module.audit.log("login_success", ip, result.login, result.source + "/" + session.role);
                 Map<String, Object> data = new LinkedHashMap<>();
                 data.put("login", session.login);
                 data.put("role", session.role);
@@ -569,6 +703,9 @@ public class ModsWebSeverlet implements NettyWebAPIHandler.SimpleSeverletHandler
             sendJson(req, HttpResponseStatus.UNAUTHORIZED, error("unauthorized", "Not authorized"));
             return;
         }
+        // Живая роль и в /api/session: перезагрузка страницы после назначения
+        // админа в БД/конфиге сразу показывает новую роль и интерфейс админа.
+        module.roleResolver.refresh(session);
         Map<String, Object> data = new LinkedHashMap<>();
         data.put("login", session.login);
         data.put("role", session.role);
@@ -651,7 +788,16 @@ public class ModsWebSeverlet implements NettyWebAPIHandler.SimpleSeverletHandler
             sendJson(req, HttpResponseStatus.NOT_FOUND, error("profile_not_found", "Profile not found"));
             return;
         }
+        // Пока бежит фоновая задача (обновление/бекап), лок профиля занят ею.
+        // Список модов читаем БЕЗ лока из файла (save атомарен) — страница
+        // после перезагрузки во время обновления остаётся рабочей и сразу
+        // открывает окно статуса (job в ответе), вместо бывших здесь 409.
+        boolean busy = module.updates.activeUpdateJob(profile.getDir()) != null
+                || module.backups.job(profile.getDir()) != null;
         Modpack modpack;
+        if (busy) {
+            modpack = module.modpacks.load(profile);
+        } else {
         // Подхват опциональности из updateOptional профиля (правки профиля
         // после импорта модпака) — под блокировкой, с сохранением при изменении
         var lock = module.modpacks.lock(profile.getDir());
@@ -683,6 +829,7 @@ public class ModsWebSeverlet implements NettyWebAPIHandler.SimpleSeverletHandler
         } finally {
             lock.unlock();
         }
+        }
         Map<String, Object> data = new LinkedHashMap<>();
         data.put("dir", profile.getDir());
         data.put("title", profile.getTitle());
@@ -698,6 +845,11 @@ public class ModsWebSeverlet implements NettyWebAPIHandler.SimpleSeverletHandler
         }
         data.put("mods", mods);
         data.put("orphans", module.modpacks.findOrphans(profile, modpack));
+        // Идёт обновление — отдаём его снимок: интерфейс сразу откроет окно статуса
+        UpdateService.UpdateJob job = module.updates.activeUpdateJob(profile.getDir());
+        if (job != null) {
+            data.put("job", jobSnapshot(job));
+        }
         sendJson(req, HttpResponseStatus.OK, ok(data));
     }
 
@@ -886,6 +1038,7 @@ public class ModsWebSeverlet implements NettyWebAPIHandler.SimpleSeverletHandler
             sendJson(req, HttpResponseStatus.NOT_FOUND, error("profile_not_found", "Profile not found"));
             return;
         }
+        if (updateJobBusy(req, profile)) return;
         var lock = module.modpacks.lock(profile.getDir());
         lock.lock();
         try {
@@ -924,6 +1077,8 @@ public class ModsWebSeverlet implements NettyWebAPIHandler.SimpleSeverletHandler
         data.put("sources", sources);
         data.put("defaultChannel", config().mods.defaultChannel);
         data.put("cacheTtlMinutes", config().mods.cacheTtlMinutes);
+        data.put("maxConcurrentDownloads", config().mods.maxConcurrentDownloads);
+        data.put("httpTimeoutSeconds", config().mods.httpTimeoutSeconds);
         data.put("verifyHash", config().mods.verifyHash);
         data.put("allowWithoutHash", config().mods.allowWithoutHash);
         data.put("autoRehash", config().mods.autoRehash);
@@ -981,6 +1136,23 @@ public class ModsWebSeverlet implements NettyWebAPIHandler.SimpleSeverletHandler
             try {
                 int ttl = body.get("cacheTtlMinutes").getAsInt();
                 config().mods.cacheTtlMinutes = Math.max(1, Math.min(1440, ttl));
+            } catch (RuntimeException ignored) {
+            }
+        }
+        // Одновременные скачивания (1–16): при изменении пул пересоздаётся на
+        // лету (UpdateService.updateConfig) — настройка действует сразу
+        if (body.has("maxConcurrentDownloads") && !body.get("maxConcurrentDownloads").isJsonNull()) {
+            try {
+                int n = body.get("maxConcurrentDownloads").getAsInt();
+                config().mods.maxConcurrentDownloads = Math.max(1, Math.min(16, n));
+            } catch (RuntimeException ignored) {
+            }
+        }
+        // Таймаут ответа источника (5–600 секунд): не ответил за это время — ошибка скачивания
+        if (body.has("httpTimeoutSeconds") && !body.get("httpTimeoutSeconds").isJsonNull()) {
+            try {
+                int s = body.get("httpTimeoutSeconds").getAsInt();
+                config().mods.httpTimeoutSeconds = Math.max(5, Math.min(600, s));
             } catch (RuntimeException ignored) {
             }
         }
@@ -1106,6 +1278,8 @@ public class ModsWebSeverlet implements NettyWebAPIHandler.SimpleSeverletHandler
         // normalizeThemes подберёт запасной вариант)
         config().normalize();
         module.saveConfig();
+        // лимит одновременных скачиваний мог измениться — пул пересоздаётся на лету
+        module.updates.syncExecutor();
         // приоритет/кэш изменились — сбрасываем кэши источников
         if (priorityChanged) {
             module.modrinthProvider.clearCache();
@@ -1127,6 +1301,8 @@ public class ModsWebSeverlet implements NettyWebAPIHandler.SimpleSeverletHandler
         data.put("sources", sources);
         data.put("defaultChannel", config().mods.defaultChannel);
         data.put("cacheTtlMinutes", config().mods.cacheTtlMinutes);
+        data.put("maxConcurrentDownloads", config().mods.maxConcurrentDownloads);
+        data.put("httpTimeoutSeconds", config().mods.httpTimeoutSeconds);
         data.put("verifyHash", config().mods.verifyHash);
         data.put("allowWithoutHash", config().mods.allowWithoutHash);
         data.put("autoRehash", config().mods.autoRehash);
@@ -1298,6 +1474,7 @@ public class ModsWebSeverlet implements NettyWebAPIHandler.SimpleSeverletHandler
             sendJson(req, HttpResponseStatus.NOT_FOUND, error("profile_not_found", "Profile not found"));
             return;
         }
+        if (updateJobBusy(req, profile)) return;
         ModsApiProvider provider = module.updates.provider(source);
         if (provider == null || !provider.available()) {
             sendJson(req, HttpResponseStatus.BAD_REQUEST, error("source_unavailable", "Source unavailable"));
@@ -1355,6 +1532,7 @@ public class ModsWebSeverlet implements NettyWebAPIHandler.SimpleSeverletHandler
             sendJson(req, HttpResponseStatus.NOT_FOUND, error("profile_not_found", "Profile not found"));
             return;
         }
+        if (updateJobBusy(req, profile)) return;
         var lock = module.modpacks.lock(profile.getDir());
         lock.lock();
         try {
@@ -1454,6 +1632,7 @@ public class ModsWebSeverlet implements NettyWebAPIHandler.SimpleSeverletHandler
             sendJson(req, HttpResponseStatus.NOT_FOUND, error("profile_not_found", "Profile not found"));
             return;
         }
+        if (updateJobBusy(req, profile)) return;
         var lock = module.modpacks.lock(profile.getDir());
         lock.lock();
         try {
@@ -1493,6 +1672,7 @@ public class ModsWebSeverlet implements NettyWebAPIHandler.SimpleSeverletHandler
             sendJson(req, HttpResponseStatus.NOT_FOUND, error("profile_not_found", "Profile not found"));
             return;
         }
+        if (updateJobBusy(req, profile)) return;
         var lock = module.modpacks.lock(profile.getDir());
         lock.lock();
         try {
@@ -1537,43 +1717,95 @@ public class ModsWebSeverlet implements NettyWebAPIHandler.SimpleSeverletHandler
             sendJson(req, HttpResponseStatus.NOT_FOUND, error("profile_not_found", "Profile not found"));
             return;
         }
-        var lock = module.modpacks.lock(profile.getDir());
-        lock.lock();
-        try {
-            Modpack modpack = module.modpacks.load(profile);
-            // 1.1.0: включение/выключение модов убрано — «скачан, значит нужен»:
-            // состав = весь модпак, поле selection из запроса игнорируется.
-            // Конфликты состав не блокируют (ограничение — только на игрока
-            // в лаунчере, через conflictFile).
-            Set<String> effective = module.modpacks.enabledIds(modpack);
-            List<UpdateService.InstallResult> installed = module.updates.applyComposition(
-                    profile, modpack, module.modpacks);
-            boolean rehashed = false;
-            if (config().mods.autoRehash) {
-                try {
-                    module.modpacks.rehash(profile.getDir());
-                    rehashed = true;
-                } catch (Exception e) {
-                    module.logger.warn("Rehash failed", e);
-                }
-            }
-            module.audit.log("mods_apply", ip, session.login, profileDir + " " + effective.size() + " mods",
-                    Map.of("installed", installed.size(), "rehashed", rehashed));
-            Map<String, Object> data = new LinkedHashMap<>();
-            data.put("applied", new ArrayList<>(effective));
-            data.put("installed", installed);
-            data.put("rehashed", rehashed);
-            List<Map<String, Object>> mods = new ArrayList<>();
-            for (ModEntry entry : modpack.mods) {
-                mods.add(modView(profile, modpack, entry));
-            }
-            data.put("mods", mods);
-            sendJson(req, HttpResponseStatus.OK, ok(data));
-        } catch (Exception e) {
-            sendJson(req, HttpResponseStatus.INTERNAL_SERVER_ERROR, error("apply_failed", String.valueOf(e.getMessage())));
-        } finally {
-            lock.unlock();
+        // 1.1.1: обновление уходит в фоновую задачу — интерфейс опрашивает
+        // /api/mods/progress и видит, какой мод качается и сколько байт уже
+        // пришло (раньше запрос молча висел до конца всех скачиваний).
+        // Бекап тоже держит лок профиля — не встаём за ним в очередь молча.
+        if (module.backups.job(profile.getDir()) != null) {
+            sendJson(req, HttpResponseStatus.CONFLICT, error("backup_busy",
+                    "Backup job is running for this profile — try again later"));
+            return;
         }
+        UpdateService.UpdateJob started = module.updates.startUpdateJob(
+                "apply", profile, module.modpacks, null, true, true, ip, session.login, module.audit);
+        if (started == null) {
+            sendJson(req, HttpResponseStatus.CONFLICT, error("update_in_progress",
+                    "Update is already running for this profile"));
+            return;
+        }
+        sendJson(req, HttpResponseStatus.OK, ok(Map.of("started", true, "type", "apply")));
+    }
+
+    /** GET /api/mods/progress — снимок фоновой задачи обновления/применения
+     *  (фаза, счётчики, статус и скачанные байты каждого мода). Только админ. */
+    private void handleUpdateProgress(WebRequest req) {
+        String profileDir = req.query("profile");
+        ClientProfile profile = module.modpacks.findProfile(profileDir);
+        if (profile == null) {
+            sendJson(req, HttpResponseStatus.NOT_FOUND, error("profile_not_found", "Profile not found"));
+            return;
+        }
+        UpdateService.UpdateJob job = module.updates.lastUpdateJob(profile.getDir());
+        if (job == null) {
+            sendJson(req, HttpResponseStatus.OK, ok(Map.of("job", null)));
+            return;
+        }
+        sendJson(req, HttpResponseStatus.OK, ok(Map.of("job", jobSnapshot(job))));
+    }
+
+    /** Снимок задачи обновления для JSON (прогресс-эндпоинт и ответ /api/mods). */
+    private Map<String, Object> jobSnapshot(UpdateService.UpdateJob job) {
+        Map<String, Object> jm = new LinkedHashMap<>();
+        jm.put("type", job.type);
+        jm.put("phase", job.phase);
+        jm.put("startedAt", job.startedAt);
+        jm.put("finishedAt", job.finishedAt);
+        jm.put("finished", job.finished);
+        jm.put("ok", job.ok);
+        if (job.error != null) jm.put("error", job.error);
+        jm.put("total", job.total);
+        jm.put("completed", job.completed);
+        jm.put("checkDone", job.checkDone);
+        jm.put("checkTotal", job.checkTotal);
+        jm.put("rehashed", job.rehashed);
+        jm.put("stopRequested", job.stopRequested);
+        jm.put("stopped", job.stopped);
+        List<Map<String, Object>> mods = new ArrayList<>();
+        for (UpdateService.ModProgress mp : job.snapshot()) {
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("id", mp.id);
+            m.put("title", mp.title);
+            m.put("status", mp.status);
+            m.put("detail", mp.detail);
+            m.put("downloaded", mp.downloaded);
+            m.put("totalBytes", mp.totalBytes);
+            mods.add(m);
+        }
+        jm.put("mods", mods);
+        if (job.finished) {
+            jm.put("results", job.results);
+        }
+        return jm;
+    }
+
+    /** POST /api/mods/update/stop — «Остановить» у бегущей задачи обновления.
+     *  Уже начатые скачивания дочитываются, не начатые — отменяются. */
+    private void handleUpdateStop(WebRequest req, String ip, SessionManager.Session session) {
+        String profileDir = req.bodyString("profile");
+        ClientProfile profile = module.modpacks.findProfile(profileDir);
+        if (profile == null) {
+            sendJson(req, HttpResponseStatus.NOT_FOUND, error("profile_not_found", "Profile not found"));
+            return;
+        }
+        UpdateService.UpdateJob job = module.updates.activeUpdateJob(profile.getDir());
+        boolean stopping = false;
+        if (job != null && !job.stopRequested) {
+            job.requestStop();
+            stopping = true;
+            module.audit.log("mods_update_stop", ip, session.login, profileDir
+                    + " phase=" + job.phase + " completed=" + job.completed + "/" + job.total);
+        }
+        sendJson(req, HttpResponseStatus.OK, ok(Map.of("stopping", stopping)));
     }
 
     private void handleUpdateMods(WebRequest req, String ip, SessionManager.Session session) {
@@ -1592,38 +1824,24 @@ public class ModsWebSeverlet implements NettyWebAPIHandler.SimpleSeverletHandler
             sendJson(req, HttpResponseStatus.NOT_FOUND, error("profile_not_found", "Profile not found"));
             return;
         }
-        var lock = module.modpacks.lock(profile.getDir());
-        lock.lock();
-        try {
-            Modpack modpack = module.modpacks.load(profile);
-            module.updates.checkUpdates(profile, modpack, module.modpacks, false);
-            List<UpdateService.InstallResult> results = module.updates.updateMods(
-                    profile, modpack, module.modpacks, ids.isEmpty() ? null : ids, includeDisabled);
-            boolean rehashed = false;
-            if (config().mods.autoRehash) {
-                try {
-                    module.modpacks.rehash(profile.getDir());
-                    rehashed = true;
-                } catch (Exception e) {
-                    module.logger.warn("Rehash failed", e);
-                }
-            }
-            module.audit.log("mods_update", ip, session.login, profileDir,
-                    Map.of("updated", results.size(), "rehashed", rehashed));
-            Map<String, Object> data = new LinkedHashMap<>();
-            data.put("results", results);
-            data.put("rehashed", rehashed);
-            List<Map<String, Object>> mods = new ArrayList<>();
-            for (ModEntry entry : modpack.mods) {
-                mods.add(modView(profile, modpack, entry));
-            }
-            data.put("mods", mods);
-            sendJson(req, HttpResponseStatus.OK, ok(data));
-        } catch (Exception e) {
-            sendJson(req, HttpResponseStatus.INTERNAL_SERVER_ERROR, error("update_failed", String.valueOf(e.getMessage())));
-        } finally {
-            lock.unlock();
+        // 1.1.1: обновление уходит в фоновую задачу — интерфейс опрашивает
+        // /api/mods/progress и видит, какой мод качается и сколько байт уже
+        // пришло (раньше запрос молча висел до конца всех скачиваний).
+        // Бекап тоже держит лок профиля — не встаём за ним в очередь молча.
+        if (module.backups.job(profile.getDir()) != null) {
+            sendJson(req, HttpResponseStatus.CONFLICT, error("backup_busy",
+                    "Backup job is running for this profile — try again later"));
+            return;
         }
+        UpdateService.UpdateJob started = module.updates.startUpdateJob(
+                "update", profile, module.modpacks, ids.isEmpty() ? null : ids,
+                includeDisabled, false, ip, session.login, module.audit);
+        if (started == null) {
+            sendJson(req, HttpResponseStatus.CONFLICT, error("update_in_progress",
+                    "Update is already running for this profile"));
+            return;
+        }
+        sendJson(req, HttpResponseStatus.OK, ok(Map.of("started", true, "type", "update")));
     }
 
     private void handleOrphans(WebRequest req) {
@@ -1644,6 +1862,7 @@ public class ModsWebSeverlet implements NettyWebAPIHandler.SimpleSeverletHandler
             sendJson(req, HttpResponseStatus.NOT_FOUND, error("profile_not_found", "Profile not found"));
             return;
         }
+        if (updateJobBusy(req, profile)) return;
         var lock = module.modpacks.lock(profile.getDir());
         lock.lock();
         try {
@@ -1676,6 +1895,7 @@ public class ModsWebSeverlet implements NettyWebAPIHandler.SimpleSeverletHandler
             sendJson(req, HttpResponseStatus.NOT_FOUND, error("profile_not_found", "Profile not found"));
             return;
         }
+        if (updateJobBusy(req, profile)) return;
         List<ModpackService.OrphanFile> files = bodyOrphanList(req, "files");
         if (files.isEmpty()) {
             sendJson(req, HttpResponseStatus.BAD_REQUEST, error("no_files", "No files to import"));
@@ -1926,6 +2146,8 @@ public class ModsWebSeverlet implements NettyWebAPIHandler.SimpleSeverletHandler
                     "Profile '" + suggestion.profileDir + "' no longer exists — reject instead"));
             return;
         }
+        // фоновая задача обновления держит лок профиля — одобрение подождёт её конца
+        if (updateJobBusy(req, profile)) return;
         ModsApiProvider provider = module.updates.provider(suggestion.source);
         if (provider == null || !provider.available()) {
             sendJson(req, HttpResponseStatus.BAD_REQUEST, error("source_unavailable", "Source unavailable"));
@@ -2041,6 +2263,7 @@ public class ModsWebSeverlet implements NettyWebAPIHandler.SimpleSeverletHandler
                     sendJson(req, HttpResponseStatus.NOT_FOUND, error("profile_not_found", "Profile not found"));
                     return;
                 }
+                if (updateJobBusy(req, profile)) return;
                 module.modpacks.rehash(profile.getDir());
                 module.audit.log("rehash", ip, session.login, profileDir);
                 sendJson(req, HttpResponseStatus.OK, ok(Map.of("rehashed", profileDir)));
@@ -2162,6 +2385,120 @@ public class ModsWebSeverlet implements NettyWebAPIHandler.SimpleSeverletHandler
         sendJson(req, HttpResponseStatus.NOT_FOUND, error("user_not_found", "Local account not found"));
     }
 
+    // ======================================================================
+    //  Роли админов (только суперадмин)
+    // ======================================================================
+
+    /** Проверка «только суперадмин» (роль вычислена живым RoleResolver). */
+    private boolean requireSuperAdmin(WebRequest req, SessionManager.Session session) {
+        if (session == null || !RoleResolver.ROLE_SUPERADMIN.equals(session.role)) {
+            module.audit.log("superadmin_denied", req.ip(),
+                    session == null ? null : session.login, req.path);
+            sendJson(req, HttpResponseStatus.FORBIDDEN, error("superadmin_required",
+                    "Superadmin role required (list logins manually in config.superAdmins)"));
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * Известные пользователи с их ролями: локальные аккаунты (живой конфиг),
+     * суперадмины из конфига и логины активных сессий (в т.ч. аккаунты
+     * лаунчера — их состав заранее неизвестен, админами их назначает
+     * лаунчер/БД). Эффективная роль: суперадмин > «наблюдатель» (оверрайд)
+     * > базовая роль источника.
+     */
+    private void handleAdminsList(WebRequest req, SessionManager.Session session) {
+        if (!requireSuperAdmin(req, session)) return;
+        Map<String, Map<String, Object>> byLogin = new LinkedHashMap<>();
+        // 1. Локальные аккаунты сайта (живой конфиг)
+        for (ModsSiteConfig.AccountConfig account : config().accounts) {
+            if (account == null || account.login == null) continue;
+            Map<String, Object> item = new LinkedHashMap<>();
+            item.put("login", account.login);
+            item.put("source", "local");
+            item.put("baseRole", "admin".equalsIgnoreCase(account.role) ? "admin" : "viewer");
+            item.put("enabled", account.enabled);
+            byLogin.put(account.login.toLowerCase(Locale.ROOT), item);
+        }
+        // 2. Активные сессии (логины, не совпавшие с локальными аккаунтами)
+        for (SessionManager.Session s : module.sessions.list()) {
+            if (s == null || s.login == null) continue;
+            String key = s.login.toLowerCase(Locale.ROOT);
+            if (byLogin.containsKey(key)) continue;
+            Map<String, Object> item = new LinkedHashMap<>();
+            item.put("login", s.login);
+            item.put("source", s.source == null ? "launcher" : s.source);
+            item.put("baseRole", s.role == null ? "viewer" : s.role);
+            item.put("enabled", true);
+            byLogin.put(key, item);
+        }
+        // 3. Суперадмины из конфига — даже если аккаунта/сессии ещё нет
+        List<String> superAdmins = config().superAdmins;
+        for (String login : superAdmins) {
+            if (login == null || login.isBlank()) continue;
+            String key = login.toLowerCase(Locale.ROOT);
+            if (byLogin.containsKey(key)) continue;
+            Map<String, Object> item = new LinkedHashMap<>();
+            item.put("login", login);
+            item.put("source", "config");
+            item.put("baseRole", "admin");
+            item.put("enabled", true);
+            byLogin.put(key, item);
+        }
+        List<Map<String, Object>> admins = new ArrayList<>();
+        for (Map<String, Object> item : byLogin.values()) {
+            String login = String.valueOf(item.get("login"));
+            boolean superAdmin = module.roleResolver.isSuperAdmin(login);
+            boolean forcedViewer = module.adminRoles != null && module.adminRoles.isForcedViewer(login);
+            String baseRole = String.valueOf(item.get("baseRole"));
+            String effective = superAdmin ? "superadmin" : (forcedViewer ? "viewer" : baseRole);
+            item.put("superAdmin", superAdmin);
+            item.put("forcedViewer", forcedViewer);
+            item.put("effectiveRole", effective);
+            item.put("canOverride", !superAdmin);
+            admins.add(item);
+        }
+        Map<String, Object> data = new LinkedHashMap<>();
+        data.put("admins", admins);
+        data.put("viewers", module.adminRoles == null ? List.of() : module.adminRoles.viewers());
+        sendJson(req, HttpResponseStatus.OK, ok(data));
+    }
+
+    /**
+     * Суперадмин ставит/снимает пометку «наблюдатель» (viewer) админу.
+     * Записи в локальном конфиге и в БД лаунчера НЕ изменяются — пометка
+     * живёт в отдельном файле admin-roles.json и снимается так же легко.
+     */
+    private void handleAdminOverride(WebRequest req, String ip, SessionManager.Session session) {
+        if (!requireSuperAdmin(req, session)) return;
+        String login = req.bodyString("login");
+        String viewer = req.bodyString("viewer");
+        if (login == null || login.isBlank()) {
+            sendJson(req, HttpResponseStatus.BAD_REQUEST, error("bad_request", "login required"));
+            return;
+        }
+        if (login.length() > config().auth.maxFieldLength) {
+            sendJson(req, HttpResponseStatus.BAD_REQUEST, error("bad_request", "login too long"));
+            return;
+        }
+        if (module.roleResolver.isSuperAdmin(login)) {
+            sendJson(req, HttpResponseStatus.BAD_REQUEST, error("superadmin_protected",
+                    "Cannot override a superadmin"));
+            return;
+        }
+        boolean viewerFlag = "true".equalsIgnoreCase(viewer) || "1".equals(viewer);
+        module.adminRoles.setForcedViewer(login, viewerFlag);
+        // Роль у существующих сессий цели обновится при его следующем запросе
+        // (живой RoleResolver) — разлогинивать не нужно.
+        module.audit.log("admin_role_override", ip, session.login,
+                login + " -> " + (viewerFlag ? "viewer (forced)" : "default"));
+        Map<String, Object> data = new LinkedHashMap<>();
+        data.put("login", login);
+        data.put("forcedViewer", viewerFlag);
+        sendJson(req, HttpResponseStatus.OK, ok(data));
+    }
+
     private static int parseInt(String s, int def) {
         if (s == null) return def;
         try {
@@ -2190,6 +2527,301 @@ public class ModsWebSeverlet implements NettyWebAPIHandler.SimpleSeverletHandler
         error.put("message", message);
         result.put("error", error);
         return result;
+    }
+
+    // ======================================================================
+    //  Бекапы (1.1.0): все эндпоинты — только admin
+    // ======================================================================
+
+    /** Профиль из запроса (query «profile» или тело) с проверкой существования. */
+    private ClientProfile backupProfile(WebRequest req) {
+        String profileDir = req.query("profile");
+        if (profileDir == null || profileDir.isBlank()) {
+            profileDir = req.bodyString("profile");
+        }
+        if (profileDir == null || profileDir.isBlank()) {
+            sendJson(req, HttpResponseStatus.BAD_REQUEST, error("bad_request", "profile required"));
+            return null;
+        }
+        ClientProfile profile = module.modpacks.findProfile(profileDir);
+        if (profile == null) {
+            sendJson(req, HttpResponseStatus.NOT_FOUND, error("profile_not_found", "Profile not found"));
+            return null;
+        }
+        return profile;
+    }
+
+    /** Проверка id бекапа: uuid, сгенерированный модулем, или безопасное
+     *  имя чужого .mrpack (усыновлённого из config/ModsSite/backups/&lt;профиль&gt;/).
+     *  Traversal исключён: слэшей нет, «..» запрещён, расширение добавляется конкатенацией. */
+    private static boolean validBackupId(String id) {
+        if (id == null || id.isEmpty() || id.length() > 100) return false;
+        if (id.contains("..")) return false;
+        return id.matches("[A-Za-z0-9._-]+");
+    }
+
+    /** Имя бекапа: 1..100 символов без управляющих символов. */
+    private static String sanitizeBackupName(String name) {
+        if (name == null) return null;
+        String s = name.trim();
+        StringBuilder sb = new StringBuilder();
+        for (char c : s.toCharArray()) {
+            if (c >= 32 || c == ' ') sb.append(c);
+        }
+        s = sb.toString().trim();
+        if (s.length() > 100) s = s.substring(0, 100);
+        return s.isEmpty() ? null : s;
+    }
+
+    private void handleBackupsList(WebRequest req) {
+        if (!config().backup.enabled) {
+            sendJson(req, HttpResponseStatus.SERVICE_UNAVAILABLE, error("backups_disabled", "Backups disabled"));
+            return;
+        }
+        ClientProfile profile = backupProfile(req);
+        if (profile == null) return;
+        try {
+            List<Map<String, Object>> backups = new ArrayList<>();
+            long total = 0;
+            for (BackupService.BackupMeta meta : module.backups.list(profile.getDir())) {
+                long size = module.backups.size(profile.getDir(), meta.id);
+                if (size < 0) continue;
+                total += size;
+                Map<String, Object> item = new LinkedHashMap<>();
+                item.put("id", meta.id);
+                item.put("name", meta.name);
+                item.put("createdAt", meta.createdAt);
+                item.put("size", size);
+                item.put("frozen", meta.frozen);
+                item.put("foreign", meta.foreign);
+                item.put("remoteCount", meta.remoteCount);
+                item.put("fileCount", meta.fileCount);
+                backups.add(item);
+            }
+            Map<String, Object> data = new LinkedHashMap<>();
+            data.put("backups", backups);
+            data.put("totalSize", total);
+            data.put("count", backups.size());
+            BackupService.Job job = module.backups.job(profile.getDir());
+            data.put("job", job == null ? null : Map.of(
+                    "type", job.type, "startedAt", job.startedAt, "message", job.message));
+            BackupService.JobResult result = module.backups.lastResult(profile.getDir());
+            data.put("lastResult", result == null ? null : Map.of(
+                    "type", result.type, "ok", result.ok, "message", result.message,
+                    "finishedAt", result.finishedAt));
+            Modpack modpack = module.modpacks.load(profile);
+            List<String> folders = module.backups.resolveFolders(profile, modpack);
+            data.put("folders", folders);
+            data.put("foldersCustom", modpack.backupFolders != null && !modpack.backupFolders.isEmpty());
+            // Папки сборки профиля для чекбоксов выбора (что бекапить)
+            data.put("profileFolders", module.backups.profileFolders(profile, modpack));
+            data.put("enabled", config().backup.enabled);
+            data.put("maxBackups", config().backup.maxBackups);
+            sendJson(req, HttpResponseStatus.OK, ok(data));
+        } catch (IOException e) {
+            sendJson(req, HttpResponseStatus.INTERNAL_SERVER_ERROR, error("io", String.valueOf(e.getMessage())));
+        }
+    }
+
+    private void handleBackupCreate(WebRequest req, String ip, SessionManager.Session session) {
+        if (!config().backup.enabled) {
+            sendJson(req, HttpResponseStatus.SERVICE_UNAVAILABLE, error("backups_disabled", "Backups disabled"));
+            return;
+        }
+        ClientProfile profile = backupProfile(req);
+        if (profile == null) return;
+        String name = sanitizeBackupName(req.bodyString("name"));
+        if (name == null) name = BackupService.defaultName();
+        try {
+            module.backups.startCreate(profile, name, ip, session.login);
+        } catch (BackupService.BusyException e) {
+            sendJson(req, HttpResponseStatus.CONFLICT, error("backup_busy", String.valueOf(e.getMessage())));
+            return;
+        }
+        sendJson(req, HttpResponseStatus.ACCEPTED, ok(Map.of("started", true, "name", name)));
+    }
+
+    private void handleBackupRename(WebRequest req, String ip, SessionManager.Session session) {
+        ClientProfile profile = backupProfile(req);
+        if (profile == null) return;
+        String id = req.bodyString("id");
+        String name = sanitizeBackupName(req.bodyString("name"));
+        if (!validBackupId(id) || name == null) {
+            sendJson(req, HttpResponseStatus.BAD_REQUEST, error("bad_request", "id and name required"));
+            return;
+        }
+        try {
+            module.backups.rename(profile.getDir(), id, name);
+            module.audit.log("backup_rename", ip, session.login, "ok",
+                    Map.of("profile", profile.getDir(), "id", id, "name", name));
+            sendJson(req, HttpResponseStatus.OK, ok(Map.of("renamed", true)));
+        } catch (IOException e) {
+            sendJson(req, HttpResponseStatus.NOT_FOUND, error("backup_not_found", String.valueOf(e.getMessage())));
+        }
+    }
+
+    private void handleBackupFreeze(WebRequest req, String ip, SessionManager.Session session) {
+        ClientProfile profile = backupProfile(req);
+        if (profile == null) return;
+        String id = req.bodyString("id");
+        Boolean frozen = null;
+        if (req.body().has("frozen") && !req.body().get("frozen").isJsonNull()) {
+            try {
+                frozen = req.body().get("frozen").getAsBoolean();
+            } catch (RuntimeException ignored) {
+            }
+        }
+        if (!validBackupId(id) || frozen == null) {
+            sendJson(req, HttpResponseStatus.BAD_REQUEST, error("bad_request", "id and frozen required"));
+            return;
+        }
+        try {
+            module.backups.setFrozen(profile.getDir(), id, frozen);
+            module.audit.log("backup_freeze", ip, session.login, frozen ? "freeze" : "unfreeze",
+                    Map.of("profile", profile.getDir(), "id", id));
+            sendJson(req, HttpResponseStatus.OK, ok(Map.of("frozen", frozen)));
+        } catch (IOException e) {
+            sendJson(req, HttpResponseStatus.NOT_FOUND, error("backup_not_found", String.valueOf(e.getMessage())));
+        }
+    }
+
+    private void handleBackupDelete(WebRequest req, String ip, SessionManager.Session session) {
+        ClientProfile profile = backupProfile(req);
+        if (profile == null) return;
+        String id = req.bodyString("id");
+        if (!validBackupId(id)) {
+            sendJson(req, HttpResponseStatus.BAD_REQUEST, error("bad_request", "id required"));
+            return;
+        }
+        try {
+            module.backups.delete(profile.getDir(), id);
+            module.audit.log("backup_delete", ip, session.login, "ok",
+                    Map.of("profile", profile.getDir(), "id", id));
+            sendJson(req, HttpResponseStatus.OK, ok(Map.of("deleted", true)));
+        } catch (IOException e) {
+            String message = String.valueOf(e.getMessage());
+            if (message.contains("frozen")) {
+                sendJson(req, HttpResponseStatus.CONFLICT, error("backup_frozen", message));
+            } else {
+                sendJson(req, HttpResponseStatus.NOT_FOUND, error("backup_not_found", message));
+            }
+        }
+    }
+
+    private void handleBackupRestore(WebRequest req, String ip, SessionManager.Session session) {
+        if (!config().backup.enabled) {
+            sendJson(req, HttpResponseStatus.SERVICE_UNAVAILABLE, error("backups_disabled", "Backups disabled"));
+            return;
+        }
+        ClientProfile profile = backupProfile(req);
+        if (profile == null) return;
+        String id = req.bodyString("id");
+        if (!validBackupId(id)) {
+            sendJson(req, HttpResponseStatus.BAD_REQUEST, error("bad_request", "id required"));
+            return;
+        }
+        try {
+            module.backups.startRestore(profile, id, ip, session.login);
+        } catch (BackupService.BusyException e) {
+            sendJson(req, HttpResponseStatus.CONFLICT, error("backup_busy", String.valueOf(e.getMessage())));
+            return;
+        } catch (IOException e) {
+            sendJson(req, HttpResponseStatus.NOT_FOUND, error("backup_not_found", String.valueOf(e.getMessage())));
+            return;
+        }
+        sendJson(req, HttpResponseStatus.ACCEPTED, ok(Map.of("started", true)));
+    }
+
+    private void handleBackupFolders(WebRequest req, String ip, SessionManager.Session session) {
+        ClientProfile profile = backupProfile(req);
+        if (profile == null) return;
+        List<String> raw = req.bodyArray("folders");
+        List<String> folders = new ArrayList<>();
+        for (String folder : raw) {
+            String normalized = BackupService.normalizeFolder(folder);
+            if (normalized == null) {
+                sendJson(req, HttpResponseStatus.BAD_REQUEST, error("bad_folder",
+                        "Invalid folder: " + folder));
+                return;
+            }
+            if (!folders.contains(normalized)) folders.add(normalized);
+            if (folders.size() > 16) {
+                sendJson(req, HttpResponseStatus.BAD_REQUEST, error("bad_folder", "Too many folders (max 16)"));
+                return;
+            }
+        }
+        try {
+            module.backups.saveFolders(profile, folders);
+            module.audit.log("backup_folders", ip, session.login, "ok",
+                    Map.of("profile", profile.getDir(), "folders", folders));
+            sendJson(req, HttpResponseStatus.OK, ok(Map.of("folders", folders)));
+        } catch (IOException e) {
+            sendJson(req, HttpResponseStatus.INTERNAL_SERVER_ERROR, error("io", String.valueOf(e.getMessage())));
+        }
+    }
+
+    /** Скачивание бекапа (GET, admin; сессия в cookie). Файл — настоящий
+     *  .mrpack (zip): его можно открыть в Modrinth App или восстановить модулем.
+     *  Потоковая передача не нужна для умного формата (метаданные + конфиги —
+     *  мегабайты), а неограниченное чтение в память — риск OOM; большие архивы
+     *  забираются с сервера напрямую из config/ModsSite/backups/. */
+    private static final long MAX_BACKUP_DOWNLOAD_BYTES = 128L * 1024 * 1024;
+
+    private void handleBackupDownload(WebRequest req, String ip, SessionManager.Session session) {
+        String id = req.query("id");
+        if (!validBackupId(id)) {
+            sendJson(req, HttpResponseStatus.BAD_REQUEST, error("bad_request", "id required"));
+            return;
+        }
+        try {
+            String profileDir = req.query("profile");
+            if (profileDir == null || profileDir.isBlank()) {
+                sendJson(req, HttpResponseStatus.BAD_REQUEST, error("bad_request", "profile required"));
+                return;
+            }
+            BackupService.BackupMeta meta = module.backups.meta(profileDir, id);
+            Path zip = module.backups.zipOf(profileDir, id);
+            if (meta == null || zip == null) {
+                sendJson(req, HttpResponseStatus.NOT_FOUND, error("backup_not_found", "Backup not found"));
+                return;
+            }
+            long size;
+            try {
+                size = java.nio.file.Files.size(zip);
+            } catch (IOException e) {
+                sendJson(req, HttpResponseStatus.INTERNAL_SERVER_ERROR, error("io", "Cannot read backup"));
+                return;
+            }
+            if (size > MAX_BACKUP_DOWNLOAD_BYTES) {
+                sendJson(req, HttpResponseStatus.REQUEST_ENTITY_TOO_LARGE, error("backup_too_large",
+                        "Backup is too large for web download (" + (size / (1024 * 1024))
+                                + " MB > 128 MB). Copy it from config/ModsSite/backups/ on the server."));
+                return;
+            }
+            byte[] bytes;
+            try {
+                bytes = java.nio.file.Files.readAllBytes(zip);
+            } catch (IOException e) {
+                sendJson(req, HttpResponseStatus.INTERNAL_SERVER_ERROR, error("io", "Cannot read backup"));
+                return;
+            }
+            String fileName = (meta.name == null ? "backup" : meta.name)
+                    .replaceAll("[^\\w\\-. ]+", "_") + ".mrpack";
+            DefaultFullHttpResponse response = new DefaultFullHttpResponse(HttpVersion.HTTP_1_1,
+                    HttpResponseStatus.OK, Unpooled.wrappedBuffer(bytes));
+            response.headers().set(HttpHeaderNames.CONTENT_TYPE, "application/zip");
+            response.headers().set(HttpHeaderNames.CONTENT_LENGTH, bytes.length);
+            response.headers().set("Content-Disposition",
+                    "attachment; filename=\"" + fileName + "\"; filename*=UTF-8''"
+                            + java.net.URLEncoder.encode(fileName, java.nio.charset.StandardCharsets.UTF_8));
+            response.headers().set(HttpHeaderNames.CACHE_CONTROL, "no-store");
+            applySecurityHeaders(response);
+            req.ctx.writeAndFlush(response).addListener(io.netty.channel.ChannelFutureListener.CLOSE);
+            module.audit.log("backup_download", ip, session.login, "ok",
+                    Map.of("profile", profileDir, "id", id));
+        } catch (IOException e) {
+            sendJson(req, HttpResponseStatus.INTERNAL_SERVER_ERROR, error("io", String.valueOf(e.getMessage())));
+        }
     }
 
     private void sendJson(WebRequest req, HttpResponseStatus status, Object payload) {

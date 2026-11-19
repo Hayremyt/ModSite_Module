@@ -93,7 +93,8 @@ automated checks: 430 smoke, 27+ live API/browser checks — all green).
 9. [HTTP and HTTPS](#http-and-https)
 10. [Console commands](#console-commands)
 11. [Configuration (all options)](#configuration)
-12. [Web API](#web-api)
+12. [Backups](#backups)
+13. [Web API](#web-api)
 
 ---
 
@@ -132,6 +133,31 @@ The ready jar: `build/libs/ModsSite_module.jar`.
 The distribution zip already contains a **pre-built and tested**
 `ModsSite_module.jar` (on 5.7.13) — if you are not changing the source code,
 you can skip the build entirely.
+
+### GitHub Actions: build by button and releases
+
+`.github/workflows/build.yml` ships with the sources — pushing the repo to
+GitHub is the only setup needed:
+
+1. Open the **Actions** tab -> **Build & Release** -> **Run workflow**.
+2. Leave `release_tag` empty for a build-only run — `ModsSite_module.jar` and
+   the distribution zip appear in the run's **Artifacts**.
+3. Set `release_tag` to `v1.1.1` to also publish a GitHub Release with both
+   files attached; the tag is created automatically if it does not exist yet.
+4. Pushing a `v*` tag does the same automatically, no button needed.
+
+Where does CI get the LaunchServer jars? It downloads `LaunchServerBuild.zip`
+from the GravitLauncher releases
+(`https://github.com/GravitLauncher/Launcher/releases/latest/download/LaunchServerBuild.zip`,
+cached per release tag; a specific release can be pinned via the `ls_release`
+input) and unpacks it next to the project — the same `lib` directory the local
+build expects, so LaunchServer does not have to be committed to the repo.
+
+Two guards are built in: the release tag must match the module version
+(`v1.1.1` <-> `version = "1.1.1"` in `build.gradle.kts`, otherwise the run
+fails with a hint), and every run verifies the produced jar (main class,
+`Module-Main-Class` manifest attribute, the CurseForge `totalCount` parsing
+present in the bytecode) and prints its SHA-256 into the log.
 
 ## Installation
 
@@ -206,14 +232,22 @@ alive without replacing the jar.
 5. **"Apply composition"** — downloads missing files and syncs the profile's
    `updateOptional` with the composition (there are no "disabled" mods
    anymore).
-6. **"Check updates"** / **"Update all"** — version refresh (don't want a
-   specific version? use the per-mod **"Postpone"** button).
-7. **"Update hashes"** — forced hash recalculation of the profile, after which
+6. **"Check updates"** — refreshes mod info AND checks sources for newer
+   versions (don't want a specific version? use the per-mod **"Postpone"**
+   button). **"Update all"** updates ONLY what the check found (plus mods
+   whose file is missing) — it never re-downloads already-actual mods.
+   While an update runs, both buttons just open the progress window.
+7. **Progress window** shows per-mod status and bytes, and has a **"Stop"**
+   button: downloads already started are finished, queued ones are cancelled.
+   If you reload or close the page mid-update, the window reopens by itself
+   (the running job survives on the server).
+8. **"Update hashes"** — forced hash recalculation of the profile, after which
    launcher clients sync files on next launch (download new ones and
    **delete stale files**, including old mod versions).
-8. The update-check order (Modrinth/CurseForge) and modpack behavior live on
-   the **"Settings"** tab; if you edited profiles/*.json by hand — the
-   **"Reload profiles"** button.
+9. The update-check order (Modrinth/CurseForge), the number of **parallel
+   downloads** and the **source response timeout** live on the **"Settings"**
+   tab; if you edited profiles/*.json by hand — the **"Reload profiles"**
+   button.
 
 ## Interface and themes
 
@@ -475,9 +509,13 @@ and error blocks are announced as live regions for screen readers.
   switched off by the PLAYER locally — the launcher won't download it
   (exclusion via `OptionalActionFile.files`).
 - **Updates with file renames**: every mod stores `installedFileName`. On
-  update the new file is downloaded (with SHA-1/SHA-512 verification from the
-  Modrinth/CurseForge API), then **the old file is deleted by its stored
-  name** — that is why renames never leave garbage behind.
+  update the new file is downloaded to a temp file (with SHA-1/SHA-512
+  verification from the Modrinth/CurseForge API), then **atomically moved
+  into place and only afterwards is the old file deleted by its stored
+  name** — renames never leave garbage behind, and a failed download/verify
+  or a disk error leaves the old working mod untouched (1.1.1: the file is
+  replaced only after the new one is fully in place; the `.part` temp file
+  is always cleaned up).
 - **Hashes**: after any change (and via the button),
   `LocalProfilesProvider.sync(...)` is invoked — the same mechanism the
   `sync` command uses.
@@ -664,6 +702,35 @@ column of the first row is compared to `trueValues` (case-insensitive).
   an otpauth:// link are printed to the console). For launcher accounts — the
   `launcherAuth.extraTotp` map: `{"login": "base32-secret"}`.
 
+### Live roles and superadmin
+
+Roles are **re-evaluated on every request** instead of being frozen at login:
+
+- granted an admin in the launcher DB (or in permissions) — reload the page —
+  they are an admin already; revoked — the rights disappear on the very next
+  request (no logout needed);
+- changed a role in the `accounts` config section — picked up immediately:
+  the module config file is re-read automatically whenever it changes on disk
+  (accounts, roles, superadmins, domains — no `mods reload`, no restart);
+- removed/disabled a local account — admin rights are dropped immediately.
+
+**Superadmin** — logins are set ONLY manually in the module config file:
+
+```json
+"superAdmins": ["your_login"]
+```
+
+It works no matter where the account comes from — the launcher DB or a local
+record. A superadmin has all admin rights and is the only one who sees the
+**Security → Roles** sub-tab, where any admin can be marked as a **viewer**:
+
+- the mark is stored in a separate file `config/ModsSite/admin-roles.json`;
+- **the admin record in the config or launcher DB is not modified** — the
+  override is removed just as easily (the "Restore role" button);
+- a superadmin cannot be demoted (`superadmin_protected`);
+- role changes apply without logout — on the user's next request; the audit
+  log records `admin_role_override` and `superadmin_denied`.
+
 ## Security
 
 Everything can be toggled independently in the config.
@@ -746,7 +813,44 @@ THE ROOT of that domain:
 - both addresses work simultaneously and lead to the same site;
 - several domains can be listed (up to 16, via the site settings or the
   config: one per line or comma-separated);
-- the port in the Host header is ignored: write the domain without a port.
+- the port in the Host header is ignored: write the domain without a port;
+- any form of the domain is accepted — `mods.example.com`,
+  `https://mods.example.com/`, `mods.example.com:443` all normalize to the
+  same host;
+- **subdomains via wildcard**: an entry `*.example.com` matches ANY subdomain
+  of `example.com` at any depth (`mods.example.com`, `a.b.example.com`). The
+  bare `example.com` is NOT included — add it as a separate line if the site
+  should also open at the apex. A `*` anywhere else (e.g. `a.*.com`) is
+  rejected by the sanitizer.
+- matching is exact otherwise: `mods.example.com` does NOT match
+  `example.com` or `other.mods.example.com` — list each domain you want.
+
+If the site does not open in the domain root, check two common causes:
+
+1. **A reverse proxy (nginx, Caddy, Cloudflare) replaces the Host header.**
+   By default `proxy_pass` sends the proxied address as Host, so the module
+   sees `Host: 127.0.0.1:9274` instead of your domain and does not match it
+   (this is why it may work on localhost but not on the real domain). Fix:
+
+   ```nginx
+   location / {
+       proxy_pass http://127.0.0.1:9274;
+       proxy_set_header Host $host;
+       proxy_set_header X-Forwarded-Host $host;
+       proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+   }
+   ```
+
+   The module also checks `X-Forwarded-Host` (first value) when proxy headers
+   are trusted (`web.trustProxyHeaders` = `true`/`auto` + netty `ipForwarding`),
+   so either header is enough.
+
+2. **The domain is simply missing from `web.siteDomains`.** The module logs a
+   WARN (max once per minute per host) whenever a site-like path (`/`, static
+   files) arrives with a Host that is not in the list — the log names the
+   exact Host it received AND the currently configured domains, so the
+   missing entry is obvious. For subdomains, either add the exact subdomain
+   or a wildcard `*.example.com`.
 
 Important: only the listed domains are served in the root. Root requests of
 any other host (e.g. `http://192.0.2.10:9274/` from the launcher — profile
@@ -763,7 +867,7 @@ Config example:
 ```jsonc
 "web": {
     ...
-    "siteDomains": ["mods.example.com", "mods2.example.net"]
+    "siteDomains": ["mods.example.com", "*.example.net"]
 }
 ```
 
@@ -868,6 +972,9 @@ hand, then `mods reload` or a restart).
   "accounts": [                         // local accounts (password -> hash at startup)
     { "login": "admin", "passwordHash": "pbkdf2_sha256$...", "role": "admin", "enabled": true }
   ],
+
+  "superAdmins": [],                     // superadmins — set ONLY here manually: login, from DB or a local record;
+                                         // they manage admin roles in "Security -> Roles"
 
   "security": {
     "enabled": true,                    // IP bans for failed logins
@@ -986,6 +1093,117 @@ automatically):
 versions, `resourcepack` — files in `resourcepacks/`, `shader` — in
 `shaderpacks/`).
 
+## Backups
+
+Version 1.1.0 adds a per-profile **backup system** (the "Backups" tab, admin
+only). A backup is a **real `.mrpack`** (the Modrinth modpack format) stored
+in `config/ModsSite/backups/<profile>/<uuid>.mrpack`:
+
+- **mrpack structure**: `modrinth.index.json` at the root (`formatVersion: 1`,
+  `game: "minecraft"`, `files[]` with `path`, `hashes` (sha1 + sha512),
+  `env`, `downloads`, `fileSize`, and `dependencies` with `minecraft`) plus
+  `overrides/` for local files. Backups can be opened in the Modrinth app or
+  any other mrpack-compatible tool, and are restored by the module itself.
+- **Smart content storage**: mods/resourcepacks/shaders with a
+  Modrinth/CurseForge binding are NOT archived — each becomes a `files[]`
+  entry with a direct download link (Modrinth CDN /
+  CurseForge redirect); on restore the exact same file is re-downloaded and
+  verified against the recorded sha1/sha512. If the direct link fails, the
+  version is re-fetched by id from the source API (fallback). Files without a
+  binding (local mods, configs) go into `overrides/`.
+- **Module sidecar**: `modssite.index.json` inside the archive (ignored by
+  third-party mrpack tools) stores the backup id/name/date, the list of
+  backed-up folders and the modpack snapshot
+  (`config/ModsSite/modpacks/<profile>.json`); on restore it is written back,
+  `updateOptional` is re-synced, and profile hashes are recalculated (if
+  `mods.autoRehash`).
+- **Backup folders** are picked **with checkboxes right in the Backups tab** —
+  the list is built from the folders that actually exist in the profile build
+  folder (`updates/<profile>/`) plus the standard content folders. Empty
+  selection (the "Default" button) = `mods`, `resourcepacks`, `shaderpacks`
+  with your overrides; tick e.g. `config` or `scripts` as well (up to 16).
+- Each row shows the backup **size**, the top shows the **total size of all
+  backups**. The name defaults to the current date and time and can be
+  renamed. The **Freeze** button protects a backup from accidental deletion
+  (frozen backups are also never auto-pruned).
+- Automatic pruning: when a profile exceeds `backup.maxBackups` (30), the
+  oldest NON-frozen OWN backups are removed first (frozen and foreign mrpack
+  files do not consume the quota).
+- Restoring returns the selected folders and the modpack to the backup state
+  (a true snapshot): linked content is re-downloaded from Modrinth/CurseForge,
+  files added to those folders after the backup are removed (ignored patterns
+  and temp files are left alone). Files with `env.client = "unsupported"`
+  (server-side content) are skipped — a LaunchServer profile is a client
+  build. Restores are asynchronous — the tab polls the running job and shows
+  a toast with the result (files restored / re-downloaded / removed / failed,
+  each failure is also written to the log).
+- Backups can be downloaded from the UI as `.mrpack` (up to 128 MB; larger
+  ones — take them from `config/ModsSite/backups/` on the server directly).
+
+**Foreign mrpack files**: you can drop ANY valid `.mrpack` into the profile
+backup folder (`config/ModsSite/backups/<profile>/`) — including a pack for
+a DIFFERENT build downloaded from Modrinth. It appears in the list once the
+tab is opened (the meta is built from `modrinth.index.json`; file names with
+spaces/unicode are normalized to a safe id) and is restored like any backup:
+`overrides/` and `client-overrides/` unpack into the build folder, `files[]`
+are downloaded with sha1/sha512 verification, covered folders (top-level path
+segments of the manifest) are cleaned of extra files — the build becomes
+equal to the foreign pack. The modpack state is rebuilt from the manifest:
+files with cdn.modrinth.com / curseforge.com links get source bindings,
+the rest become local entries (adopt them later via the "orphan import").
+If the pack targets a different Minecraft version, the result message
+includes a warning. Frozen and foreign mrpack files are never auto-pruned
+(only manual deletion).
+
+Security notes: backup archives are written atomically; on restore every
+path from the manifest and every `overrides/` entry is validated (no `..`,
+no absolute paths — nothing can escape the profile folder), symlinks are
+never archived, direct downloads are only allowed from an https allowlist
+(Modrinth CDN, CurseForge mirrors, GitHub) and are size-capped and
+hash-verified, and all backup operations are audit-logged.
+
+Config (`mods.backup.*` in Config.json): `enabled` (true), `maxBackups` (30),
+`maxFiles` (5000), `maxTotalMb` (2048).
+
+## Update progress (1.1.1)
+
+`POST /mods/api/mods/update` ("Update all" / per-mod "Update") and
+`POST /mods/api/mods/apply` ("Apply composition") no longer hang the request
+until every download finishes. The server starts a **background job** and
+answers immediately; the admin UI opens a progress window and polls
+`GET /mods/api/mods/progress` every 0.7 s, so it is always visible:
+
+- current **phase**: preparing → checking (`12/40`) → downloading →
+  rehashing → done;
+- **per-mod rows**: waiting / checking / downloading (with live byte
+  counters, e.g. `3.4 / 7.1 MiB`) / updated (version) / skipped / error;
+- overall progress bar (`completed / total`).
+
+Only one background job per profile: a second attempt returns
+409 `update_in_progress`, and the UI simply attaches to the running job.
+While the job holds the profile lock, other profile-mutating endpoints
+(check/add/remove/skip/import/clean/rehash/…) answer 409 `update_in_progress`
+instead of blocking; the mod list itself (`GET /mods/api/mods`) stays
+available during an update (lock-free snapshot, atomic saves) and carries
+the job snapshot, so the progress window reopens automatically after a page
+reload. The progress window can be collapsed — the job keeps
+running and a toast with the final `updated: X/Y` summary appears anyway.
+
+**Stopping an update (1.1.1).** The progress window has a **Stop** button
+(`POST /mods/api/mods/update/stop`): downloads that already started are
+finished and installed, mods that never started are cancelled (marked
+"cancelled" in the list and removed from the queue) and the final summary
+reports how many were finished vs cancelled.
+
+**Fail-safe installs (1.1.1).** A mod file is replaced only after the fresh
+download has been fully written and hash-verified, and the replacement itself
+is an atomic rename where the filesystem supports it (with a backup/restore
+fallback where it does not). The previous file is deleted only after the new
+one is in place — so a broken download, a hash mismatch, a timeout or a disk
+error can never leave "no mod at all": the old version keeps working. Optional
+mods go through the same path, and a stuck per-mod task no longer hides the
+results of the rest of the batch.
+
 ## Web API
 
 Every response: `{"success": true, "data": ...}` or
@@ -1009,9 +1227,11 @@ session data.
 | POST | `/mods/api/mods/settings` | admin | mod settings (optional/channel/deps/conflicts/note) |
 | POST | `/mods/api/mods/skip` | admin | "Postpone"/clear it (`{profile,id,skip}`) |
 | POST | `/mods/api/mods/resolve-deps` | admin | re-link dependencies from the API |
-| POST | `/mods/api/mods/check` | admin | check updates (the response contains `updatesAvailable` and `relinked` — how many mods were re-linked to the priority source) |
-| POST | `/mods/api/mods/update` | admin | update mod(s)/all (postponed are skipped, marked `postponed`) |
-| POST | `/mods/api/mods/apply` | admin | apply composition: download missing files and sync `updateOptional` (body: `{profile}` only) |
+| POST | `/mods/api/mods/check` | admin | check updates (the response contains `updatesAvailable` and `relinked` — how many mods were re-linked to the priority source); 409 `update_in_progress` while a background update job runs |
+| POST | `/mods/api/mods/update` | admin | start a **background** update job (mod(s)/all) — responds immediately with `{started:true, type:"update"}`; progress via `/mods/progress` (postponed mods are skipped, marked `postponed`) |
+| POST | `/mods/api/mods/update/stop` | admin | request stop of the running update job: started downloads finish, queued ones are cancelled; responds `{stopping:true}` |
+| POST | `/mods/api/mods/apply` | admin | start a **background** apply-composition job (download missing files, sync `updateOptional`); responds `{started:true, type:"apply"}`, progress via `/mods/progress` |
+| GET | `/mods/api/mods/progress?profile=...` | admin | snapshot of the background update/apply job: `phase` (`preparing/checking/downloading/rehashing/done/error`), counters, per-mod status and downloaded bytes; `results` when finished |
 | GET | `/mods/api/mods/orphans?profile=` | admin | extra files (all content folders; response `{kind,name}[]`) |
 | POST | `/mods/api/mods/clean` | admin | delete extra files (`files` — objects `{name,kind}`; strings are treated as mods) |
 | POST | `/mods/api/mods/import` | admin | import extra files (same `files` format) |
@@ -1029,6 +1249,14 @@ session data.
 | GET | `/mods/api/audit?offset=&limit=` | admin | audit journal |
 | GET | `/mods/api/users` | admin | local accounts |
 | POST | `/mods/api/users/password` | admin | change a local account's password |
+| GET | `/mods/api/backups?profile=` | admin | backup list: `{backups[{id,name,createdAt,size,frozen,remoteCount,fileCount}], totalSize, job, lastResult, folders, profileFolders[{name,exists}]}` |
+| POST | `/mods/api/backups/create` | admin | create a backup `{profile, name}` (async, HTTP 202; name defaults to date+time) |
+| POST | `/mods/api/backups/rename` | admin | rename `{profile, id, name}` |
+| POST | `/mods/api/backups/freeze` | admin | freeze/unfreeze `{profile, id, frozen}` |
+| POST | `/mods/api/backups/delete` | admin | delete `{profile, id}` (refuses with `backup_frozen` on frozen ones) |
+| POST | `/mods/api/backups/restore` | admin | restore `{profile, id}` (async, HTTP 202) |
+| POST | `/mods/api/backups/folders` | admin | set backup folders `{profile, folders[]}` (relative paths, up to 16) |
+| GET | `/mods/api/backups/download?profile=&id=` | admin | download a backup zip (max 128 MB, `backup_too_large` otherwise) |
 
 ---
 
@@ -1039,6 +1267,7 @@ config/ModsSite/Config.json        — settings
 config/ModsSite/ipfilter.json      — bans/whitelist/blacklist
 config/ModsSite/sessions.json      — sessions (token hashes)
 config/ModsSite/modpacks/*.json    — modpack compositions
+config/ModsSite/backups/<profile>/ — profile backups (*.mrpack + *.json meta)
 config/ModsSite/audit.log.jsonl    — audit journal
 config/ModsSite/web/*              — web UI (editable on disk!)
 ```

@@ -42,6 +42,18 @@ public class ModsSiteConfig {
      *  при первом старте он будет автоматически заменён на PBKDF2-хэш. */
     public List<AccountConfig> accounts = new ArrayList<>();
 
+    /**
+     * Логины суперадминов — задаются ТОЛЬКО вручную в этом файле.
+     * Суперадмин имеет полные права администратора независимо от того,
+     * откуда пришёл аккаунт (локальная запись здесь или БД лаунчера),
+     * и единственный может в панели Безопасность -> Роли помечать
+     * других админов «наблюдателями» (viewer) — сама запись админа
+     * в конфиге или БД при этом не изменяется.
+     * Сравнение логинов — без учёта регистра; изменения подхватываются
+     * на живую (без перезапуска сервера).
+     */
+    public List<String> superAdmins = new ArrayList<>();
+
     // ==================== БЕЗОПАСНОСТЬ ====================
 
     /** Защита от подбора пароля: баны IP с нарастающим сроком, whitelist/blacklist. */
@@ -68,6 +80,11 @@ public class ModsSiteConfig {
     /** Настройки источников модов и работы с модпаками. */
     public ModsConfig mods = new ModsConfig();
 
+    // ==================== БЕКАПЫ ====================
+
+    /** Система бекапов профилей (вкладка «Бекапы»). */
+    public BackupConfig backup = new BackupConfig();
+
     /** IP, которые никогда не блокируются (дублируется/дополняется командой mods whitelist). */
     public List<String> whitelist = new ArrayList<>();
 
@@ -83,6 +100,8 @@ public class ModsSiteConfig {
         if (launcherAuth.adminCheck == null) launcherAuth.adminCheck = new LauncherAdminCheck();
         if (launcherAuth.adminCheck.sql == null) launcherAuth.adminCheck.sql = new SqlAdminCheck();
         if (accounts == null) accounts = new ArrayList<>();
+        // суперадмины: trim, без пустых/дублей, максимум 16 логинов
+        superAdmins = sanitizeLogins(superAdmins, 16);
         if (security == null) security = new SecurityConfig();
         if (security.accountLock == null) security.accountLock = new AccountLockConfig();
         if (rateLimit == null) rateLimit = new RateLimitConfig();
@@ -91,6 +110,10 @@ public class ModsSiteConfig {
         logging.consoleLevel = ModsSiteLogLevels.normalize(logging.consoleLevel);
         normalizeThemes();
         if (mods == null) mods = new ModsConfig();
+        if (backup == null) backup = new BackupConfig();
+        backup.maxBackups = Math.max(1, Math.min(500, backup.maxBackups));
+        backup.maxFiles = Math.max(10, Math.min(50_000, backup.maxFiles));
+        backup.maxTotalMb = Math.max(16, Math.min(1024L * 64, backup.maxTotalMb));
         if (mods.modrinth == null) mods.modrinth = new ModrinthConfig();
         if (mods.curseforge == null) mods.curseforge = new CurseForgeConfig();
         if (mods.modsIgnore == null) mods.modsIgnore = new ArrayList<>(List.of(".index"));
@@ -140,6 +163,30 @@ public class ModsSiteConfig {
         relaxSecurityDefaults();
     }
 
+    /** Санитизация списка логинов (superAdmins): trim, без пустых и дублей
+     *  (регистр сохраняется, сравнение всегда без учёта регистра). */
+    private static List<String> sanitizeLogins(List<String> raw, int max) {
+        if (raw == null) return new ArrayList<>();
+        List<String> result = new ArrayList<>();
+        for (String item : raw) {
+            if (item == null) continue;
+            String login = stripKeyNoise(item);
+            if (login.isEmpty() || login.length() > 128) continue;
+            boolean duplicate = false;
+            for (String existing : result) {
+                if (existing.equalsIgnoreCase(login)) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (!duplicate) {
+                result.add(login);
+                if (result.size() >= max) break;
+            }
+        }
+        return result;
+    }
+
     /** Убрать у ключа/токена случайные пробелы и обёртку из кавычек (после ручного редактирования конфига). */
     private static String stripKeyNoise(String value) {
         String s = value.strip();
@@ -160,13 +207,16 @@ public class ModsSiteConfig {
     /**
      * Санитизация списка доменов сайта: trim, нижний регистр, без порта,
      * без завершающей точки, без пустых и дублей. null — пустой список.
+     * <p>Поддерживается wildcard «*.example.com» — любой поддомен example.com.
+     * Звёздочка в любом другом месте («a.*.com», «*ample.com») — запись
+     * отбрасывается, чтобы такой домен никогда не совпал случайно.
      */
     public static List<String> sanitizeSiteDomains(List<String> raw) {
         if (raw == null) return new ArrayList<>();
         List<String> result = new ArrayList<>();
         for (String item : raw) {
             String domain = normalizeDomain(item);
-            if (!domain.isEmpty() && !result.contains(domain)) {
+            if (!domain.isEmpty() && isAcceptableDomainPattern(domain) && !result.contains(domain)) {
                 result.add(domain);
                 if (result.size() >= MAX_SITE_DOMAINS) break;
             }
@@ -174,13 +224,50 @@ public class ModsSiteConfig {
         return result;
     }
 
-    /** Нормализовать один домен: trim, нижний регистр, без портa и завершающей точки. */
+    /** «*» допустим только в позиции wildcard-префикса: «*.example.com». */
+    private static boolean isAcceptableDomainPattern(String domain) {
+        int star = domain.indexOf('*');
+        if (star < 0) return true;
+        return star == 0 && domain.length() > 2 && domain.charAt(1) == '.'
+                && domain.indexOf('*', 1) < 0;
+    }
+
+    /**
+     * Нормализовать один домен: trim, нижний регистр, без схемы (http://, https://),
+     * пути после "/", userinfo ("@"), портa и завершающей точки. Так админ может
+     * вставить домен в любом виде — "https://mods.example.com/" и
+     * "mods.example.com" дают одно и то же значение.
+     */
     public static String normalizeDomain(String raw) {
         if (raw == null) return "";
-        String s = stripKeyNoise(raw).toLowerCase();
+        String s = stripKeyNoise(raw).strip().toLowerCase();
         if (s.isEmpty()) return "";
+        // Схема: http://, https://, ws:// и т.п. — отрезаем вместе с "://"
+        int scheme = s.indexOf("://");
+        if (scheme >= 0) {
+            s = s.substring(scheme + 3);
+        }
+        // Путь: "mods.example.com/" → "mods.example.com"
+        int slash = s.indexOf('/');
+        if (slash >= 0) {
+            s = s.substring(0, slash);
+        }
+        // userinfo ("user@host" из URL) — берём часть после последнего "@"
+        int at = s.lastIndexOf('@');
+        if (at >= 0) {
+            s = s.substring(at + 1);
+        }
+        s = s.strip();
+        // IPv6-литерал в скобках: "[::1]:9274" → "::1" (то же, что отдаёт
+        // siteDomainMatches, распарсив Host-заголовок, — чтобы совпали)
+        if (s.startsWith("[")) {
+            int close = s.indexOf(']');
+            return close > 0 ? s.substring(1, close) : "";
+        }
+        // Порт срезаем только у обычного имени хоста (ровно один ':');
+        // несколько ':' без скобок — «голый» IPv6, его не трогаем.
         int colon = s.lastIndexOf(':');
-        if (colon > 0 && !s.contains("]")) {
+        if (colon > 0 && s.indexOf(':') == colon) {
             s = s.substring(0, colon); // "mods.example.com:8080" → "mods.example.com"
         }
         while (s.endsWith(".")) {
@@ -192,7 +279,13 @@ public class ModsSiteConfig {
     /**
      * Совпадает ли Host-заголовок запроса с одним из доменов сайта.
      * Порт в заголовке не учитывается ("mods.example.com:9274" → "mods.example.com"),
-     * IPv6-литералы в скобках поддерживаются. Пустой список — совпадений нет.
+     * IPv6-литералы в скобках поддерживаются.
+     * <p>Wildcards: запись «*.example.com» совпадает с любым поддоменом
+     * example.com любой глубины ("mods.example.com", "a.b.example.com");
+     * сам example.com под wildcard НЕ входит — при необходимости добавьте
+     * его отдельной строкой. Точные записи совпадают только «1 в 1»:
+     * «mods.example.com» не совпадает с «example.com» и наоборот.
+     * Пустой список — совпадений нет.
      */
     public static boolean siteDomainMatches(List<String> domains, String hostHeader) {
         if (domains == null || domains.isEmpty() || hostHeader == null || hostHeader.isBlank()) {
@@ -208,8 +301,30 @@ public class ModsSiteConfig {
         while (host.endsWith(".")) {
             host = host.substring(0, host.length() - 1);
         }
+        if (host.isEmpty()) return false;
         for (String domain : domains) {
-            if (domain != null && !domain.isBlank() && domain.equals(host)) return true;
+            if (domain == null || domain.isBlank()) continue;
+            // Защитная нормализация записи конфига: обычно это уже сделала
+            // sanitizeSiteDomains, но матчер не должен зависеть от этого
+            // (например, конфиг правлен вручную и ещё не прошёл rehash).
+            String d = domain.trim().toLowerCase();
+            if (d.startsWith("[") && d.contains("]")) {
+                d = d.substring(1, d.indexOf(']')); // "[::1]:9274" → "::1"
+            } else {
+                int colon = d.lastIndexOf(':');
+                if (colon > 0 && d.indexOf(':') == colon) d = d.substring(0, colon);
+            }
+            while (d.endsWith(".")) {
+                d = d.substring(0, d.length() - 1);
+            }
+            if (d.startsWith("*.") && d.length() > 2) {
+                // ".example.com" — хост должен заканчиваться этим суффиксом
+                // и быть ДЛИННЕЕ его (иначе совпадёт сам "example.com")
+                String suffix = d.substring(1);
+                if (host.length() > suffix.length() && host.endsWith(suffix)) return true;
+            } else if (d.equals(host)) {
+                return true;
+            }
         }
         return false;
     }
@@ -692,6 +807,18 @@ public class ModsSiteConfig {
         public int maxPerUser = 5;
         /** Логины, лишённые права предлагать (сравнение без учёта регистра). */
         public List<String> bannedUsers = new ArrayList<>();
+    }
+
+    /** Настройки системы бекапов (config/ModsSite/backups/&lt;профиль&gt;/). */
+    public static class BackupConfig {
+        /** Разрешить создание/восстановление бекапов. */
+        public boolean enabled = true;
+        /** Максимум бекапов на профиль: старые НЕзамороженные удаляются автоматически. */
+        public int maxBackups = 30;
+        /** Максимум локальных файлов в одном бекапе (защита от «папки на 100k файлов»). */
+        public int maxFiles = 5000;
+        /** Максимум суммарного объёма локальных файлов в одном бекапе, МБ. */
+        public long maxTotalMb = 2048;
     }
 
     public static class ModrinthConfig {

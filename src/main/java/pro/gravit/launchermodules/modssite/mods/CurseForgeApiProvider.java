@@ -407,6 +407,13 @@ public class CurseForgeApiProvider extends ModsApiProvider {
         result.total = pagination == null ? 0
                 : optLong(pagination, "totalCount", optLong(pagination, "total", 0));
         JsonArray dataArray = response.getAsJsonArray("data");
+        // Диагностика «Найдено: 0»: если на странице есть результаты, а счётчик
+        // нулевой — формат ответа изменился; печатаем фактическую pagination
+        if (result.total == 0 && dataArray != null && !dataArray.isEmpty()) {
+            logger.warn("CurseForge search: счётчик 0 при {} результатах на странице — pagination: {} "
+                    + "(похоже, изменился формат ответа — пришлите этот лог разработчику)",
+                    dataArray.size(), pagination);
+        }
         // диагностика «Найдено: 0»: полный URL запроса и ответ — в debug-лог
         logger.debug("CurseForge search: {} -> total={}, data={}", url,
                 result.total, dataArray == null ? "(нет)" : dataArray.size());
@@ -537,68 +544,13 @@ public class CurseForgeApiProvider extends ModsApiProvider {
         JsonArray dataArray = response.getAsJsonArray("data");
         if (dataArray == null) return result;
         for (JsonElement element : dataArray) {
-            JsonObject file = element.getAsJsonObject();
-            RemoteVersionInfo version = new RemoteVersionInfo();
-            version.source = id();
-            version.projectId = projectId;
-            version.versionId = String.valueOf(optLong(file, "id", 0));
-            version.versionNumber = optString(file, "displayName");
-            version.fileName = optString(file, "fileName");
-            version.url = optString(file, "downloadUrl");
-            version.datePublished = 0;
-            String date = optString(file, "fileDate");
-            if (date != null) {
-                try {
-                    version.datePublished = java.time.Instant.parse(date).toEpochMilli();
-                } catch (Exception ignored) {
-                }
-            }
-            int releaseType = (int) optLong(file, "releaseType", 1);
-            version.releaseType = switch (releaseType) {
-                case 2 -> "beta";
-                case 3 -> "alpha";
-                default -> "release";
-            };
-            version.gameVersions = stringList(file.get("gameVersions"));
-            version.loaders = version.gameVersions.stream()
-                    .filter(v -> "Forge".equals(v) || "Fabric".equals(v) || "Quilt".equals(v) || "NeoForge".equals(v))
-                    .toList();
+            RemoteVersionInfo version = parseFile(element.getAsJsonObject());
+            if (version == null) continue;
             // Фильтр по загрузчику: имя загрузчика должно быть в gameVersions файла
             if (loaderName != null && !version.gameVersions.contains(loaderName)) {
                 continue;
             }
-            JsonArray depArray = file.getAsJsonArray("dependencies");
-            if (depArray != null) {
-                for (JsonElement dep : depArray) {
-                    JsonObject depObject = dep.getAsJsonObject();
-                    long modId = optLong(depObject, "modId", 0);
-                    int relationType = (int) optLong(depObject, "relationType", 1);
-                    // Спека CurseForge: 1=EmbeddedLibrary, 2=OptionalDependency,
-                    // 3=RequiredDependency, 4=Tool, 5=Incompatible
-                    // (раньше 1 и 3 были перепутаны: required-зависимости
-                    // считались встроенными и не подтягивались)
-                    String type = switch (relationType) {
-                        case 3 -> "required";
-                        case 2 -> "optional";
-                        case 5 -> "incompatible";
-                        default -> "embedded"; // 1=embedded, 4=tool
-                    };
-                    if (modId != 0) {
-                        version.dependencies.add(new RemoteVersionInfo.RemoteDependency(id(), String.valueOf(modId), type));
-                    }
-                }
-            }
-            JsonArray hashes = file.getAsJsonArray("hashes");
-            if (hashes != null) {
-                for (JsonElement h : hashes) {
-                    JsonObject hash = h.getAsJsonObject();
-                    if (isSha1Algo(optString(hash, "algo"))) {
-                        version.sha1 = optString(hash, "value");
-                    }
-                }
-            }
-            boolean serverPack = file.has("isServerPack") && !file.get("isServerPack").isJsonNull()
-                    && file.get("isServerPack").getAsBoolean();
+            boolean serverPack = isServerPack(element.getAsJsonObject());
             if (serverPack || version.url == null) {
                 continue;
             }
@@ -607,5 +559,81 @@ public class CurseForgeApiProvider extends ModsApiProvider {
         // Свежие сверху
         result.sort((a, b) -> Long.compare(b.datePublished, a.datePublished));
         return result;
+    }
+
+    /** GET /v1/mods/files/{fileId} — точный файл по ID (восстановление бекапов). */
+    @Override
+    public RemoteVersionInfo versionById(String versionId) throws Exception {
+        if (!available()) return null;
+        if (versionId == null || versionId.isBlank()) return null;
+        JsonObject file = httpGetJson(baseUrl() + "/v1/mods/files/" + urlEncode(versionId), headers()).getAsJsonObject();
+        if (file == null || !file.has("id")) return null;
+        return parseFile(file);
+    }
+
+    private static boolean isServerPack(JsonObject file) {
+        return file.has("isServerPack") && !file.get("isServerPack").isJsonNull()
+                && file.get("isServerPack").getAsBoolean();
+    }
+
+    /** Разбор объекта файла CurseForge (общий для /mods/{id}/files и /mods/files/{id}). */
+    private RemoteVersionInfo parseFile(JsonObject file) {
+        if (file == null) return null;
+        RemoteVersionInfo version = new RemoteVersionInfo();
+        version.source = id();
+        version.projectId = String.valueOf(optLong(file, "modId", 0));
+        version.versionId = String.valueOf(optLong(file, "id", 0));
+        version.versionNumber = optString(file, "displayName");
+        version.fileName = optString(file, "fileName");
+        version.url = optString(file, "downloadUrl");
+        version.datePublished = 0;
+        String date = optString(file, "fileDate");
+        if (date != null) {
+            try {
+                version.datePublished = java.time.Instant.parse(date).toEpochMilli();
+            } catch (Exception ignored) {
+            }
+        }
+        int releaseType = (int) optLong(file, "releaseType", 1);
+        version.releaseType = switch (releaseType) {
+            case 2 -> "beta";
+            case 3 -> "alpha";
+            default -> "release";
+        };
+        version.gameVersions = stringList(file.get("gameVersions"));
+        version.loaders = version.gameVersions.stream()
+                .filter(v -> "Forge".equals(v) || "Fabric".equals(v) || "Quilt".equals(v) || "NeoForge".equals(v))
+                .toList();
+        JsonArray depArray = file.getAsJsonArray("dependencies");
+        if (depArray != null) {
+            for (JsonElement dep : depArray) {
+                JsonObject depObject = dep.getAsJsonObject();
+                long modId = optLong(depObject, "modId", 0);
+                int relationType = (int) optLong(depObject, "relationType", 1);
+                // Спека CurseForge: 1=EmbeddedLibrary, 2=OptionalDependency,
+                // 3=RequiredDependency, 4=Tool, 5=Incompatible
+                // (раньше 1 и 3 были перепутаны: required-зависимости
+                // считались встроенными и не подтягивались)
+                String type = switch (relationType) {
+                    case 3 -> "required";
+                    case 2 -> "optional";
+                    case 5 -> "incompatible";
+                    default -> "embedded"; // 1=embedded, 4=tool
+                };
+                if (modId != 0) {
+                    version.dependencies.add(new RemoteVersionInfo.RemoteDependency(id(), String.valueOf(modId), type));
+                }
+            }
+        }
+        JsonArray hashes = file.getAsJsonArray("hashes");
+        if (hashes != null) {
+            for (JsonElement h : hashes) {
+                JsonObject hash = h.getAsJsonObject();
+                if (isSha1Algo(optString(hash, "algo"))) {
+                    version.sha1 = optString(hash, "value");
+                }
+            }
+        }
+        return version;
     }
 }

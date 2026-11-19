@@ -177,7 +177,7 @@
                 <button class="btn ghost small" id="btn-lang" title="Language / Язык" type="button">
                     <svg class="icon" aria-hidden="true"><use href="#i-globe"/></svg><span id="lang-label">EN</span>
                 </button>
-                <button class="btn ghost small" id="btn-logout" type="button">
+                <button class="btn ghost small" id="btn-logout" type="button" data-i18n-title="topbar.logout" title="Выйти">
                     <svg class="icon" aria-hidden="true"><use href="#i-log-out"/></svg><span data-i18n="topbar.logout">Выйти</span>
                 </button>
             </div>
@@ -196,6 +196,9 @@
             </button>
             <button class="navtab hidden" id="tab-settings" type="button" role="tab" aria-selected="false">
                 <svg class="icon" aria-hidden="true"><use href="#i-settings"/></svg><span data-i18n="nav.settings">Настройки</span>
+            </button>
+            <button class="navtab hidden" id="tab-backups" type="button" role="tab" aria-selected="false">
+                <svg class="icon" aria-hidden="true"><use href="#i-shield"/></svg><span data-i18n="nav.backups">Бекапы</span>
             </button>
         </nav>
 
@@ -445,6 +448,18 @@
                             <input type="number" id="set-cacheTtlMinutes" class="input" min="1" max="1440" step="1">
                         </label>
                     </div>
+                    <div class="set-row two-inputs">
+                        <label class="set-field">
+                            <span class="set-label"><span data-i18n="settings.maxConcurrentDownloads">Одновременных скачиваний</span>
+                                <span class="muted small set-sub" data-i18n="settings.maxConcurrentDownloadsHint">сколько файлов качается параллельно при обновлении (1–16), действует сразу</span></span>
+                            <input type="number" id="set-maxConcurrentDownloads" class="input" min="1" max="16" step="1">
+                        </label>
+                        <label class="set-field">
+                            <span class="set-label"><span data-i18n="settings.httpTimeoutSeconds">Таймаут ответа источника, сек</span>
+                                <span class="muted small set-sub" data-i18n="settings.httpTimeoutSecondsHint">если источник не ответил за это время — ошибка скачивания (5–600)</span></span>
+                            <input type="number" id="set-httpTimeoutSeconds" class="input" min="5" max="600" step="1">
+                        </label>
+                    </div>
                     <label class="set-row">
                         <span class="set-label"><span data-i18n="settings.siteDomains">Домены сайта (адрес в корне)</span>
                             <span class="muted small set-sub" data-i18n="settings.siteDomainsHint">по одному в строке или через запятую: сайт откроется и как ip:порт/mods/, и в корне этих доменов (например mods.example.com); применяется сразу</span></span>
@@ -582,6 +597,9 @@
                     <button class="subnavtab" id="subtab-users" type="button">
                         <svg class="icon" aria-hidden="true"><use href="#i-users"/></svg><span data-i18n="admin.users">Аккаунты</span>
                     </button>
+                    <button class="subnavtab hidden" id="subtab-roles" type="button">
+                        <svg class="icon" aria-hidden="true"><use href="#i-shield"/></svg><span data-i18n="admin.roles.tab">Роли</span>
+                    </button>
                 </nav>
 
             <section id="admin-bans" class="admin-section">
@@ -681,7 +699,96 @@
                     Учётные записи лаунчера управляются самим лаунчером.
                 </p>
             </section>
+
+            <!-- Роли админов: доступно только суперадмину (config.superAdmins) -->
+            <section id="admin-roles" class="admin-section hidden">
+                <h2 class="section-title"><svg class="icon" aria-hidden="true"><use href="#i-shield"/></svg><span data-i18n="admin.roles.title">Роли админов</span></h2>
+                <div class="table-wrap">
+                    <table class="table" id="table-admin-roles">
+                        <thead>
+                        <tr>
+                            <th data-i18n="admin.login">Логин</th>
+                            <th data-i18n="admin.roles.source">Источник</th>
+                            <th data-i18n="admin.roles.effective">Действующая роль</th>
+                            <th data-i18n="admin.roles.override">Наблюдатель</th>
+                            <th></th>
+                        </tr>
+                        </thead>
+                        <tbody></tbody>
+                    </table>
+                </div>
+                <div class="ipadd" style="margin-top:12px">
+                    <span class="input-wrap">
+                        <input type="text" id="viewer-add-input" class="input" maxlength="128" data-i18n-placeholder="admin.roles.loginPlaceholder" placeholder="логин">
+                    </span>
+                    <button class="btn" id="viewer-add" type="button">
+                        <svg class="icon" aria-hidden="true"><use href="#i-plus"/></svg><span data-i18n="admin.roles.addViewer">Сделать наблюдателем</span>
+                    </button>
+                </div>
+                <p id="roles-viewers-extra" class="muted small users-hint"></p>
+                <p class="muted small users-hint" data-i18n="admin.roles.hint">
+                    Пометка «наблюдатель» действует поверх источника роли: сам аккаунт в конфиге или в БД лаунчера не изменяется —
+                    пометка хранится отдельно (admin-roles.json) и снимается так же легко. Роль пересчитывается у пользователя
+                    на каждом запросе, без разлогина. Суперадмины задаются вручную в config.superAdmins.
+                </p>
             </section>
+            </section>
+        </main>
+
+        <!-- ---------- ПАНЕЛЬ БЕКАПОВ (1.1.0, admin) ---------- -->
+        <main id="panel-backups" class="panel hidden">
+            <div class="backups-head">
+                <div>
+                    <h2 class="section-title"><svg class="icon" aria-hidden="true"><use href="#i-shield"/></svg>
+                        <span data-i18n="backups.title">Бекапы профиля</span>
+                        <span class="muted small" id="backups-count"></span>
+                    </h2>
+                    <p class="muted small" data-i18n="backups.hint">
+                        Бекап — настоящий .mrpack (формат Modrinth): контент с привязкой к Modrinth/CurseForge хранится ссылками и скачивается заново при восстановлении; остальное — в overrides внутри архива.
+                    </p>
+                    <p class="muted small" data-i18n="backups.hintDrop">
+                        Чужой .mrpack (в том числе пакет другой сборки): положите файл в config/ModsSite/backups/&lt;профиль&gt;/ на сервере — он появится в списке и восстановится как обычный бекап.
+                    </p>
+                    <p class="backups-total"><span data-i18n="backups.totalSize">Общий размер:</span> <strong id="backups-total">—</strong></p>
+                </div>
+                <div class="backups-create">
+                    <input type="text" id="backup-name" class="input" maxlength="100"
+                           data-i18n-placeholder="backups.namePlaceholder" placeholder="Имя бекапа (по умолчанию — дата и время)">
+                    <button class="btn primary" id="btn-backup-create" type="button">
+                        <svg class="icon" aria-hidden="true"><use href="#i-plus"/></svg><span data-i18n="backups.create">Создать бекап</span>
+                    </button>
+                </div>
+            </div>
+
+            <div id="backup-job" class="backup-job hidden" role="status"></div>
+
+            <section class="admin-section">
+                <h2 class="section-title"><svg class="icon" aria-hidden="true"><use href="#i-package"/></svg><span data-i18n="backups.foldersTitle">Папки бекапа</span></h2>
+                <p class="muted small settings-hint" data-i18n="backups.foldersHint">
+                    Что попадёт в бекап: отметьте галочками папки из папки сборки профиля. По умолчанию — три стандартные папки контента (mods, resourcepacks, shaderpacks с учётом ваших переопределений).
+                </p>
+                <div id="backup-folders-list" class="folder-checks" role="group" aria-label="Backup folders"></div>
+                <div class="backups-folders-actions">
+                    <button class="btn" id="btn-backup-folders-save" type="button" data-i18n="backups.foldersSave">Сохранить</button>
+                    <button class="btn ghost" id="btn-backup-folders-reset" type="button" data-i18n="backups.foldersReset">По умолчанию</button>
+                </div>
+            </section>
+
+            <div class="table-wrap">
+                <table class="table" id="table-backups">
+                    <thead>
+                        <tr>
+                            <th data-i18n="backups.colName">Имя</th>
+                            <th data-i18n="backups.colDate">Дата</th>
+                            <th data-i18n="backups.colSize">Размер</th>
+                            <th data-i18n="backups.colContent">Содержимое</th>
+                            <th></th>
+                        </tr>
+                    </thead>
+                    <tbody id="backups-tbody"></tbody>
+                </table>
+            </div>
+            <p class="muted small" id="backups-empty" data-i18n="backups.empty">Бекапов пока нет — создайте первый.</p>
         </main>
         </div>
     </div>
