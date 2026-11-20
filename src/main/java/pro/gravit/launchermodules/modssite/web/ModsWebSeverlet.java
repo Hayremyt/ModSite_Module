@@ -463,6 +463,10 @@ public class ModsWebSeverlet implements NettyWebAPIHandler.SimpleSeverletHandler
                 if (isPost) withSession(req, true, true, (session) -> handleResolveDeps(req, ip, session));
                 else sendJson(req, HttpResponseStatus.METHOD_NOT_ALLOWED, error("method", "POST only"));
             }
+            case "/api/mods/scan" -> {
+                if (isPost) withSession(req, true, true, (session) -> handleScan(req, ip, session));
+                else sendJson(req, HttpResponseStatus.METHOD_NOT_ALLOWED, error("method", "POST only"));
+            }
             case "/api/mods/orphans" -> {
                 if (!isPost) withSession(req, true, true, (session) -> handleOrphans(req));
                 else sendJson(req, HttpResponseStatus.METHOD_NOT_ALLOWED, error("method", "GET only"));
@@ -1701,13 +1705,77 @@ public class ModsWebSeverlet implements NettyWebAPIHandler.SimpleSeverletHandler
                 if (check != null && check.relinked) relinked++;
                 result.add(modView(profile, modpack, modpack.mods.get(i)));
             }
+            // 1.1.3: записи, чей файл отсутствует на диске (удалён руками) —
+            // подсказка «откройте Скан папки»: проверка такое не чинит сама
+            int missingFiles = module.modpacks.findMissingFiles(profile, modpack).size();
             Map<String, Object> data = new LinkedHashMap<>();
             data.put("updatesAvailable", updated);
             data.put("relinked", relinked);
+            data.put("missingFiles", missingFiles);
             data.put("mods", result);
             if (!summary.warnings.isEmpty()) {
                 data.put("warnings", summary.warnings);
             }
+            sendJson(req, HttpResponseStatus.OK, ok(data));
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /** POST /api/mods/scan — «Скан папки» (1.1.3): перечитать папки контента
+     *  и показать, где они разошлись со списком модпака.
+     *  1. Файлы с Minecraft-кодами цвета в именах (&a, §c…) переименовываются
+     *     сразу (записи модпака и updateOptional актуализируются).
+     *  2. deleted — записи, чей файл удалён руками: можно восстановить
+     *     (заново скачать через задачу обновления — /api/mods/update с ids)
+     *     или убрать из списка (/api/mods/remove).
+     *  3. added — файлы, добавленные руками: принять в состав (/api/mods/import)
+     *     или удалить с диска (/api/mods/clean).
+     *  Сам список обработчик не меняет — решение принимает админ построчно
+     *  или массовыми кнопками «оставшиеся». */
+    private void handleScan(WebRequest req, String ip, SessionManager.Session session) {
+        String profileDir = req.bodyString("profile");
+        ClientProfile profile = module.modpacks.findProfile(profileDir);
+        if (profile == null) {
+            sendJson(req, HttpResponseStatus.NOT_FOUND, error("profile_not_found", "Profile not found"));
+            return;
+        }
+        if (updateJobBusy(req, profile)) return;
+        var lock = module.modpacks.lock(profile.getDir());
+        lock.lock();
+        try {
+            Modpack modpack = module.modpacks.load(profile);
+            // 1. Сначала переименования кодов цвета — до прочих проверок
+            List<Map<String, Object>> renamed =
+                    module.modpacks.renameColorCodedFiles(profile, modpack);
+            // 2. Файлы, удалённые руками
+            List<Map<String, Object>> deleted =
+                    module.modpacks.findMissingFiles(profile, modpack);
+            // восстановить можно то, у чего есть привязка к источнику —
+            // чисто локальный файл заново скачать не из чего
+            for (Map<String, Object> item : deleted) {
+                Object source = item.get("source");
+                ModsApiProvider provider = source == null ? null
+                        : module.updates.provider(String.valueOf(source));
+                item.put("canRestore", provider != null && provider.available());
+            }
+            // 3. Файлы, добавленные руками
+            List<ModpackService.OrphanFile> added =
+                    module.modpacks.findOrphans(profile, modpack);
+            if (config().mods.autoRehash && !renamed.isEmpty()) {
+                try {
+                    module.modpacks.rehash(profile.getDir());
+                } catch (Exception e) {
+                    module.logger.warn("Rehash after scan failed", e);
+                }
+            }
+            module.audit.log("mods_scan", ip, session.login, profileDir
+                    + " renamed=" + renamed.size()
+                    + " deleted=" + deleted.size() + " added=" + added.size());
+            Map<String, Object> data = new LinkedHashMap<>();
+            data.put("renamed", renamed);
+            data.put("deleted", deleted);
+            data.put("added", added);
             sendJson(req, HttpResponseStatus.OK, ok(data));
         } finally {
             lock.unlock();

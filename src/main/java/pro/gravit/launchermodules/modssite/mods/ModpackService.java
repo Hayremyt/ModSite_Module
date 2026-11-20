@@ -16,7 +16,9 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
@@ -324,6 +326,110 @@ public class ModpackService {
         return removed;
     }
 
+    // ======================= Скан папки (1.1.3) =======================
+
+    /**
+     * Записи модпака, чей установленный файл отсутствует на диске
+     * (удалён руками, потерян при сбое и т.п.). Для «Скан папки» и
+     * счётчика missingFiles в ответе проверки обновлений.
+     */
+    public List<Map<String, Object>> findMissingFiles(ClientProfile profile, Modpack modpack) {
+        List<Map<String, Object>> missing = new ArrayList<>();
+        for (ModEntry entry : modpack.mods) {
+            if (entry == null || entry.installedFileName == null
+                    || entry.installedFileName.isBlank()) continue;
+            Path file = kindDir(profile, modpack, entry.kindOrMod())
+                    .resolve(UpdateService.sanitizeFileName(entry.installedFileName));
+            if (!Files.isRegularFile(file)) {
+                Map<String, Object> item = new LinkedHashMap<>();
+                item.put("id", entry.id);
+                item.put("name", entry.name);
+                item.put("kind", entry.kindOrMod());
+                item.put("fileName", entry.installedFileName);
+                item.put("version", entry.installedVersionNumber);
+                item.put("source", entry.source);
+                item.put("projectId", entry.projectId);
+                missing.add(item);
+            }
+        }
+        return missing;
+    }
+
+    /**
+     * Переименовать файлы с Minecraft-кодами цвета в именах («Pack &a.zip» →
+     * «Pack.zip») в папках контента профиля. GravitLauncher на такие имена
+     * спотыкается. Записи модпака, владеющие файлом, обновляются
+     * (installedFileName, previousFileNames), согласуется updateOptional
+     * профиля (модпак сохраняется только при изменениях записей). Файлы,
+     * не принадлежащие записям, — просто переименовываются. Чужой файл
+     * целевое имя не затирает: при коллизии добавляется суффикс « (2)».
+     *
+     * @return список переименований {kind, from, to}
+     */
+    public List<Map<String, Object>> renameColorCodedFiles(ClientProfile profile, Modpack modpack) {
+        List<Map<String, Object>> renamed = new ArrayList<>();
+        boolean entriesChanged = false;
+        for (String kind : Kinds.ALL) {
+            Path dir = kindDir(profile, modpack, kind);
+            if (!Files.isDirectory(dir)) continue;
+            List<Path> files = new ArrayList<>();
+            try (DirectoryStream<Path> stream = Files.newDirectoryStream(dir)) {
+                for (Path p : stream) {
+                    if (Files.isRegularFile(p)) files.add(p);
+                }
+            } catch (IOException e) {
+                logger.error("Cannot list {} dir", kind, e);
+                continue;
+            }
+            for (Path file : files) {
+                String name = file.getFileName().toString();
+                if (name.endsWith(".part") || name.endsWith(".tmp")) continue;
+                if (!UpdateService.hasColorCodes(name)) continue;
+                String cleaned = UpdateService.stripColorCodes(name);
+                if (cleaned == null || cleaned.isBlank()) cleaned = "file.bin";
+                // не затереть чужой файл: суффикс « (2)», « (3)»… перед расширением
+                if (Files.exists(dir.resolve(cleaned)) && !cleaned.equals(name)) {
+                    String base = cleaned;
+                    String ext = "";
+                    int dot = cleaned.lastIndexOf('.');
+                    if (dot > 0) {
+                        base = cleaned.substring(0, dot);
+                        ext = cleaned.substring(dot);
+                    }
+                    int i = 2;
+                    while (Files.exists(dir.resolve(base + " (" + i + ")" + ext))) i++;
+                    cleaned = base + " (" + i + ")" + ext;
+                }
+                try {
+                    Files.move(file, dir.resolve(cleaned));
+                } catch (IOException e) {
+                    logger.error("Cannot rename color-coded file {}", name, e);
+                    continue;
+                }
+                Map<String, Object> item = new LinkedHashMap<>();
+                item.put("kind", kind);
+                item.put("from", name);
+                item.put("to", cleaned);
+                renamed.add(item);
+                // запись, владевшая файлом, — обновить имя (старое запоминается
+                // в previousFileNames, updateOptional перепривяжется reconcile'ом)
+                for (ModEntry entry : modpack.mods) {
+                    if (entry != null && kind.equals(entry.kindOrMod())
+                            && name.equals(entry.installedFileName)) {
+                        entry.pushPreviousFileName(name);
+                        entry.installedFileName = cleaned;
+                        entriesChanged = true;
+                    }
+                }
+            }
+        }
+        if (entriesChanged) {
+            optionalSync.reconcile(profile, modpack);
+            save(profile, modpack);
+        }
+        return renamed;
+    }
+
     // ======================= Подхват опциональных из профиля =======================
 
     /**
@@ -483,24 +589,25 @@ public class ModpackService {
     // ======================= Хэши =======================
 
     /**
-     * Пересчитать хэши (HashedDir) профилей. Это то, что делает команда sync:
-     * клиенты увидят изменения при следующем запуске.
-     *
-     * @param dirName имя директории профиля или null — все профили
+     * Пересчитать хэши профилей. 1.1.3: кнопка «Обновить хэши» и авто-rehash
+     * модуля запускают консольную команду {@code config profileprovider sync} —
+     * полный sync «чтобы точно»: HashedDir ВСЕХ папок updates + перечитывание
+     * списка профилей с диска (profiles/*.json). Аргумент dirName сохранён
+     * для совместимости вызовов; команда синхронизирует всё сразу.
      */
     public void rehash(String dirName) throws IOException {
-        if (!(server.config.profilesProvider instanceof LocalProfilesProvider local)) {
-            throw new IOException("Rehash supported only for local profiles provider");
-        }
-        if (dirName == null) {
-            local.sync(null);
-        } else {
-            local.sync(List.of(dirName));
+        try {
+            server.commandHandler.evalNative("config profileprovider sync", false);
+        } catch (Exception e) {
+            throw new IOException("config profileprovider sync failed: "
+                    + (e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage()), e);
         }
     }
 
+    /** Rehash доступен, пока у сервера есть консольная команда config. */
     public boolean rehashSupported() {
-        return server.config.profilesProvider instanceof LocalProfilesProvider;
+        return server.commandHandler != null
+                && server.commandHandler.findCommand("config") != null;
     }
 
     // ======================= Добавление/удаление модов =======================

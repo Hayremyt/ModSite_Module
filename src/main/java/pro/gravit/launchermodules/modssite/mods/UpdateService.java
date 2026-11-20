@@ -32,6 +32,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.regex.Pattern;
 
 /**
  * Проверка обновлений и скачивание файлов модов.
@@ -483,6 +484,15 @@ public class UpdateService {
         boolean changed = false;
         String gameVersion = modpackService.gameVersion(profile, modpack);
         String loader = modpackService.loader(profile, modpack);
+        // 1.1.3: перечитываем папки перед проверкой — файлы с Minecraft-кодами
+        // цвета в именах («Pack &a.zip», «§c») переименовываются, записи
+        // модпака актуализируются. До сопоставления хэшей: поиск и хэширование
+        // должны идти уже по чистым именам. Сбой переименования не валит проверку.
+        try {
+            modpackService.renameColorCodedFiles(profile, modpack);
+        } catch (Throwable t) {
+            logger.error("Color-code rename pass failed", t);
+        }
         // 1. Кто подлежит проверке (кэш записей с TTL)
         List<ModEntry> toCheck = new ArrayList<>();
         for (ModEntry entry : modpack.mods) {
@@ -1341,14 +1351,41 @@ public class UpdateService {
         }
     }
 
-    /** Безопасное имя файла (без путей). */
+    /**
+     * Minecraft-коды цвета/форматирования в именах файлов: «&a», «§c» и т.п.
+     * (попадают из названий ресурспаков с CurseForge — «Pack &aCool.zip»). На
+     * такие имена GravitLauncher спотыкается, поэтому они вырезаются на ВСЕХ
+     * путях записи файлов (sanitizeFileName) и уже лежащие файлы переименовываются
+     * при «Скан папки»/«Проверить обновления» (renameColorCodedFiles).
+     * Вырезается ТОЛЬКО валидная пара «&|§ + символ кода»: 0-9, a-f (цвета),
+     * k-o (форматирование), r (сброс) — регистр не важен. Прочие «&» остаются
+     * на месте: «ATM&T.jar» не пострадает («T» — не код).
+     */
+    private static final Pattern COLOR_CODE = Pattern.compile("[§&][0-9a-fA-Fk-oK-OrR]");
+
+    /** В имени файла есть Minecraft-код цвета («&a», «§c»…). */
+    public static boolean hasColorCodes(String name) {
+        return name != null && COLOR_CODE.matcher(name).find();
+    }
+
+    /** Чистое имя: без кодов цвета Minecraft и пробелов по краям. */
+    public static String stripColorCodes(String name) {
+        if (name == null) return null;
+        return COLOR_CODE.matcher(name).replaceAll("").trim();
+    }
+
+    /** Безопасное имя файла (без путей и кодов цвета Minecraft). */
     public static String sanitizeFileName(String name) {
         if (name == null || name.isBlank()) return "mod.jar";
         name = name.replace('\\', '/');
         int slash = name.lastIndexOf('/');
         if (slash >= 0) name = name.substring(slash + 1);
         name = name.replace("\u0000", "");
+        // 1.1.3: коды цвета Minecraft в имени файла («Pack &a.zip») — GravitLauncher
+        // на них спотыкается; вырезаем только сами коды, остальное не трогаем
+        name = COLOR_CODE.matcher(name).replaceAll("").trim();
         if (name.equals(".") || name.equals("..")) name = "mod.jar";
+        if (name.isBlank()) name = "mod.jar";
         return name;
     }
 

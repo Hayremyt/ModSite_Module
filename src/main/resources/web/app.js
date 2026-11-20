@@ -25,7 +25,8 @@ const S = {
     backupsTimer: null,   // опрос активной задачи бекапа
     backupsJobSeen: false, // задача была видна — покажем тост по завершении
     backupsFoldersDirty: false, // админ меняет галочки — не затирать при перерисовке
-    updateJob: null,      // фоновая задача обновления/применения (прогресс)
+    updateJob: null,      // фоновая задача обновления (прогресс)
+    scan: null,           // данные «Скан папки» (renamed/deleted/added)
 };
 
 /** Фильтры списка модов из localStorage (с защитой от мусора).
@@ -298,9 +299,9 @@ async function boot() {
     // Админские кнопки: наблюдателю скрываем (display:none), админу — показываем.
     // Кнопки НЕ удаляются из DOM: смена сессии наблюдатель→админ в той же
     // вкладке восстанавливает их без перезагрузки страницы.
-    // «Проверить обновления», «Обновить всё», «Обновить хэши», «Перечитать
-    // профиль», «Применить состав»; чип «авто-хэш» тоже не показываем
-    ["btn-check", "btn-update-all", "btn-rehash", "btn-reload-profile", "btn-apply"]
+    // «Проверить обновления», «Обновить всё», «Скан папки», «Обновить хэши»,
+    // «Перечитать профиль»; чип «авто-хэш» тоже не показываем
+    ["btn-check", "btn-update-all", "btn-scan", "btn-rehash", "btn-reload-profile"]
         .forEach(id => { const el = $(id); if (el) el.classList.toggle("hidden", !isAdmin); });
     // Вкладка «Роли админов» в панели Безопасность — только суперадмину
     // (логины суперадминов задаются вручную в config.superAdmins)
@@ -435,7 +436,7 @@ function modById(id) {
  *  состав (включение/выключение убрано: скачан — значит нужен), поэтому
  *  конфликтуют просто любые два мода модпака, ссылающиеся друг на друга.
  *  Пара приходит в обе стороны (конфликты симметричны) — при выводе
- *  дедуплицируется (conflictPairsText). */
+ *  дедуплицируется (conflictIds). */
 function packConflicts() {
     const mods = (S.pack && S.pack.mods) || [];
     const byId = {};
@@ -646,7 +647,7 @@ function renderPack() {
     }
     // у наблюдателя эти кнопки скрыты (скрытие при входе) — для страховки
     // держим их ещё и задизейбленными: сервер на эти POST требует админа
-    ["btn-check", "btn-apply", "btn-update-all", "btn-rehash", "btn-reload-profile"].forEach(id => {
+    ["btn-check", "btn-scan", "btn-update-all", "btn-rehash", "btn-reload-profile"].forEach(id => {
         const btn = $(id);
         if (btn) btn.disabled = !isAdmin;
     });
@@ -783,25 +784,6 @@ function renderModCard(mod, byId, conflictIds, isAdmin) {
 }
 
 /* ================= Опциональность модов ================= */
-/** Конфликтующие моды могут сосуществовать в составе одновременно
- *  (ограничение — только на игрока в лаунчере, через conflictFile),
- *  поэтому конфликты не блокируют «Применить состав», а лишь
- *  предупреждаем. Здесь — уникальные пары «A × B» (до 3, дальше «+N»). */
-function conflictPairsText(conflicts) {
-    const seen = new Set();
-    const pairs = [];
-    (conflicts || []).forEach(([a, b]) => {
-        const key = [a, b].sort().join(" ");
-        if (seen.has(key)) return;
-        seen.add(key);
-        const nameA = (modById(a) || {}).name || a;
-        const nameB = (modById(b) || {}).name || b;
-        pairs.push(nameA + " × " + nameB);
-    });
-    const shown = pairs.slice(0, 3).join(", ");
-    return pairs.length > 3 ? shown + " +" + (pairs.length - 3) : shown;
-}
-
 /** Галочка «Опциональный» на карточке: делает мод опциональным (игрок
  *  в лаунчере сможет выключить его у себя) или обязательным для всех.
  *  Тот же вызов API, что и галочка в «Настройках» записи, — modpack.json
@@ -836,6 +818,11 @@ async function checkUpdates() {
         if (relinked > 0) message += t("mods.checkRelinked", { n: relinked });
         toast(message, "success");
         showSourceWarnings(result.data.warnings);
+        // 1.1.3: файлы, удалённые руками, проверка сама не восстанавливает —
+        // подсказываем кнопку «Скан папки»
+        if ((result.data.missingFiles || 0) > 0) {
+            toast(t("mods.missingHint", { n: result.data.missingFiles }), "warn");
+        }
         await loadProfiles();
         await loadPack();
     } else if (result.error && result.error.code === "update_in_progress") {
@@ -947,7 +934,7 @@ function restoreUpdateJob(job) {
 
 function openUpdateProgressModal(type) {
     openModal(
-        '<h3 class="modal-title" id="upd-title">' + esc(type === "apply" ? t("upd.applyTitle") : t("upd.title")) + "</h3>"
+        '<h3 class="modal-title" id="upd-title">' + esc(t("upd.title")) + "</h3>"
         + '<div class="upd-phase" id="upd-phase"><span class="spin"></span><span id="upd-phase-text">'
             + esc(t("upd.preparing")) + "</span></div>"
         + '<div class="upd-bar"><div class="upd-bar-fill indeterminate" id="upd-bar"></div></div>'
@@ -1051,7 +1038,7 @@ function renderUpdateProgress(job) {
     if (!phaseText) return;
     // тип мог отличаться (прицепились к бегущей задаче) — заголовок честный
     const titleEl = $("upd-title");
-    if (titleEl) titleEl.textContent = job.type === "apply" ? t("upd.applyTitle") : t("upd.title");
+    if (titleEl) titleEl.textContent = t("upd.title");
     phaseText.textContent = updPhaseText(job);
     // на финише спиннер фазы больше не крутится
     const spin = $("upd-phase").querySelector(".spin");
@@ -1079,7 +1066,6 @@ function renderUpdateProgress(job) {
 
 function finishUpdateProgress(job, fresh) {
     if (S.updateJob && S.updateJob.timer) clearTimeout(S.updateJob.timer);
-    const type = (job && job.type) || (S.updateJob ? S.updateJob.type : "update");
     S.updateJob = null;
     if (!fresh) return;
     const results = job.results || [];
@@ -1090,8 +1076,6 @@ function finishUpdateProgress(job, fresh) {
             // задача остановлена кнопкой: сколько докачано, сколько отменено
             const done = results.filter(r => !r.error && !r.cancelled).length;
             toast(t("upd.stoppedToast", { done: done, cancelled: cancelled }), "warn");
-        } else if (type === "apply") {
-            toast(t("mods.applied"), failed.length ? "warn" : "success");
         } else {
             toast(t("mods.updated") + ": " + (results.length - failed.length - cancelled) + "/"
                 + Math.max(1, results.length - cancelled),
@@ -1105,39 +1089,6 @@ function finishUpdateProgress(job, fresh) {
         await loadProfiles();
         await loadPack();
     }, 900);
-}
-
-async function applyComposition() {
-    if (!isAdmin()) return;
-    if (!confirm(t("mods.applyConfirm"))) return;
-    // Включение/выключение модов убрано: состав = ВСЕ моды модпака
-    // («скачан — значит нужен»). «Применить состав» доставляет недостающие
-    // файлы и синхронизирует профиль. Конфликты не блокируют: игрок
-    // в лаунчере включит только одно (conflictFile) — лишь предупредим.
-    const conflicts = packConflicts();
-    const btn = $("btn-apply");
-    setBtnLoading(btn, "mods.apply", "zap", true);
-    // 1.1.1: сервер отвечает сразу (фоновая задача), прогресс — в модалке
-    const result = await api("mods/apply", {
-        method: "POST",
-        body: { profile: S.currentProfile },
-    });
-    setBtnLoading(btn, "mods.apply", "zap", false);
-    if (result.ok && result.data && result.data.started) {
-        openUpdateProgress("apply");
-    } else if (result.error && result.error.code === "update_in_progress") {
-        openUpdateProgress("apply");
-        return;
-    } else if (result.error && result.error.code === "backup_busy") {
-        toast(t("upd.backupBusy"), "warn");
-        return;
-    } else {
-        toast(result.error ? result.error.message : t("common.error"), "error");
-        return;
-    }
-    if (conflicts.length) {
-        toast(t("mods.conflictApplyWarn", { pairs: conflictPairsText(conflicts) }), "warn");
-    }
 }
 
 async function rehash() {
@@ -1217,6 +1168,223 @@ async function importOrphans() {
     orphanShowAll = false;
     await loadProfiles();
     await loadPack();
+}
+
+/* ================= Скан папки (1.1.3) ================= */
+/** Кнопка «Скан папки»: перечитываем папки контента и показываем, где они
+ *  разошлись со списком модпака — удалённые руками файлы (восстановить /
+ *  убрать из списка), добавленные руками (в состав / удалить с диска) и
+ *  переименования файлов с кодами цвета (&a, §c… — GravitLauncher на них
+ *  спотыкается; переименовываются на сервере автоматически). Каждый пункт
+ *  обрабатывается по одному, «оставшиеся» — массовыми кнопками. */
+async function openFolderScan() {
+    if (!isAdmin()) return;
+    const btn = $("btn-scan");
+    setBtnLoading(btn, "mods.scan", "search", true);
+    const result = await api("mods/scan", { method: "POST", body: { profile: S.currentProfile } });
+    setBtnLoading(btn, "mods.scan", "search", false);
+    if (!result.ok) {
+        if (result.error && result.error.code === "update_in_progress") {
+            openUpdateProgress("update");
+        } else {
+            toast(result.error ? result.error.message : t("common.error"), "error");
+        }
+        return;
+    }
+    S.scan = {
+        renamed: result.data.renamed || [],
+        deleted: result.data.deleted || [],
+        added: result.data.added || [],
+    };
+    renderScanModal();
+}
+
+/** Крайний случай «нажал на одном — и пока делается — нажать на все»:
+ *  пока идёт задача обновления (восстановление — тоже задача), все кнопки
+ *  скана неактивны; сервер дополнительно отклонит повтор (update_in_progress). */
+function scanBusy() {
+    return !!S.updateJob;
+}
+
+function scanKindBadge(kind) {
+    return kind && kind !== "mod"
+        ? `<span class="badge kind-${esc(kind)}">${esc(t("kind." + kind))}</span> `
+        : "";
+}
+
+function renderScanModal() {
+    if (!S.scan) return;
+    const d = S.scan;
+    const busy = scanBusy();
+    const rows = [];
+    // переименования — информационная секция (уже выполнены на сервере)
+    if (d.renamed.length) {
+        rows.push(`<div class="scan-head">${icon("info")}<b>${esc(t("mods.scanRenamed", { n: d.renamed.length }))}</b></div>`);
+        rows.push('<div class="scan-list">');
+        d.renamed.forEach(r => {
+            rows.push(`<div class="scan-row">${scanKindBadge(r.kind)}`
+                + `<span class="scan-name">${esc(r.from)}</span>`
+                + `<span class="scan-meta">${icon("arrow-r", "arrow")} ${esc(r.to)}</span></div>`);
+        });
+        rows.push("</div>");
+    }
+    // удалённые вручную: восстановить (скачать заново) или убрать из списка
+    if (d.deleted.length) {
+        rows.push(`<div class="scan-head warn">${icon("warn")}<b>${esc(t("mods.scanDeleted", { n: d.deleted.length }))}</b></div>`);
+        rows.push('<div class="scan-list">');
+        d.deleted.forEach(item => {
+            const id = esc(item.id);
+            const restore = item.canRestore
+                ? `<button class="btn small primary" data-scan-restore="${id}" ${busy ? "disabled" : ""}>${icon("download")}<span>${esc(t("mods.scanRestore"))}</span></button>`
+                : "";
+            rows.push(`<div class="scan-row">${scanKindBadge(item.kind)}`
+                + `<span class="scan-name">${esc(item.name || item.id)}</span>`
+                + `<span class="scan-meta">${esc(item.fileName || "")}${item.version ? " · " + esc(item.version) : ""}${item.canRestore ? "" : " · " + esc(t("mods.scanNoSource"))}</span>`
+                + `<span class="scan-actions">${restore}`
+                + `<button class="btn small danger" data-scan-remove="${id}" ${busy ? "disabled" : ""}>${icon("trash")}<span>${esc(t("mods.scanRemoveEntry"))}</span></button>`
+                + "</span></div>");
+        });
+        rows.push("</div>");
+    }
+    // добавленные вручную: принять в состав или удалить файл
+    if (d.added.length) {
+        rows.push(`<div class="scan-head">${icon("file")}<b>${esc(t("mods.scanAdded", { n: d.added.length }))}</b></div>`);
+        rows.push('<div class="scan-list">');
+        d.added.forEach(f => {
+            const key = esc(f.name);
+            const kind = esc(f.kind || "mod");
+            rows.push(`<div class="scan-row">${scanKindBadge(f.kind)}`
+                + `<span class="scan-name">${key}</span>`
+                + `<span class="scan-actions">`
+                + `<button class="btn small primary" data-scan-adopt="${key}" data-scan-adopt-kind="${kind}" ${busy ? "disabled" : ""}>${icon("package")}<span>${esc(t("mods.scanAdopt"))}</span></button>`
+                + `<button class="btn small danger" data-scan-delete="${key}" data-scan-delete-kind="${kind}" ${busy ? "disabled" : ""}>${icon("trash")}<span>${esc(t("mods.scanDeleteFile"))}</span></button>`
+                + "</span></div>");
+        });
+        rows.push("</div>");
+    }
+    if (!rows.length) {
+        rows.push(`<div class="scan-empty">${icon("check")}<span>${esc(t("mods.scanEmpty"))}</span></div>`);
+    }
+    // массовые действия — по «оставшимся» (тем, что ещё в списках)
+    const bulk = [];
+    if (d.deleted.length) {
+        const restorable = d.deleted.filter(x => x.canRestore).length;
+        if (restorable) {
+            bulk.push(`<button class="btn small primary" id="scan-restore-all" ${busy ? "disabled" : ""}>${icon("download")}<span>${esc(t("mods.scanRestoreAll", { n: restorable }))}</span></button>`);
+        }
+        bulk.push(`<button class="btn small danger" id="scan-remove-all" ${busy ? "disabled" : ""}>${icon("trash")}<span>${esc(t("mods.scanRemoveAll", { n: d.deleted.length }))}</span></button>`);
+    }
+    if (d.added.length) {
+        bulk.push(`<button class="btn small primary" id="scan-adopt-all" ${busy ? "disabled" : ""}>${icon("package")}<span>${esc(t("mods.scanAdoptAll", { n: d.added.length }))}</span></button>`);
+        bulk.push(`<button class="btn small danger" id="scan-delete-all" ${busy ? "disabled" : ""}>${icon("trash")}<span>${esc(t("mods.scanDeleteAll", { n: d.added.length }))}</span></button>`);
+    }
+    const body = `<h3 class="modal-title">${esc(t("mods.scanTitle"))}</h3>`
+        + `<div class="muted small scan-hint">${esc(t("mods.scanHint"))}</div>`
+        + rows.join("")
+        + (bulk.length ? `<div class="scan-bulk">${bulk.join("")}</div>` : "")
+        + (busy ? `<div class="muted small">${esc(t("mods.scanJobBusy"))}</div>` : "");
+    openModal(body, [{ label: t("mods.close"), onclick: () => { closeModal(); loadPack(); }, className: "btn ghost" }]);
+    const backdrop = $("modal-backdrop");
+    if (!backdrop) return;
+    backdrop.querySelectorAll("[data-scan-restore]").forEach(b =>
+        b.addEventListener("click", () => scanRestore([b.dataset.scanRestore])));
+    backdrop.querySelectorAll("[data-scan-remove]").forEach(b =>
+        b.addEventListener("click", () => scanRemoveEntries([b.dataset.scanRemove])));
+    backdrop.querySelectorAll("[data-scan-adopt]").forEach(b =>
+        b.addEventListener("click", () => scanAdopt([{ name: b.dataset.scanAdopt, kind: b.dataset.scanAdoptKind }])));
+    backdrop.querySelectorAll("[data-scan-delete]").forEach(b =>
+        b.addEventListener("click", () => scanDeleteFiles([{ name: b.dataset.scanDelete, kind: b.dataset.scanDeleteKind }])));
+    const restoreAll = $("scan-restore-all");
+    if (restoreAll) restoreAll.addEventListener("click", () => {
+        const ids = S.scan.deleted.filter(x => x.canRestore).map(x => x.id);
+        if (ids.length && confirm(t("mods.scanRestoreConfirm", { n: ids.length }))) scanRestore(ids);
+    });
+    const removeAll = $("scan-remove-all");
+    if (removeAll) removeAll.addEventListener("click", () => {
+        const ids = S.scan.deleted.map(x => x.id);
+        if (ids.length && confirm(t("mods.scanRemoveConfirm", { n: ids.length }))) scanRemoveEntries(ids);
+    });
+    const adoptAll = $("scan-adopt-all");
+    if (adoptAll) adoptAll.addEventListener("click", () => {
+        const files = S.scan.added.map(f => ({ name: f.name, kind: f.kind || "mod" }));
+        if (files.length && confirm(t("mods.scanAdoptConfirm", { n: files.length }))) scanAdopt(files);
+    });
+    const deleteAll = $("scan-delete-all");
+    if (deleteAll) deleteAll.addEventListener("click", () => {
+        const files = S.scan.added.map(f => ({ name: f.name, kind: f.kind || "mod" }));
+        if (files.length && confirm(t("mods.scanDeleteConfirm", { n: files.length }))) scanDeleteFiles(files);
+    });
+}
+
+/** Восстановить удалённые вручную файлы: обычная задача обновления по явному
+ *  списку — отсутствующий файл скачивается даже без новой версии. Прогресс —
+ *  в модалке обновления; кнопки скана снова разблокируются после финиша. */
+async function scanRestore(ids) {
+    const result = await api("mods/update", { method: "POST", body: { profile: S.currentProfile, ids } });
+    if (result.ok && result.data && result.data.started) {
+        S.scan.deleted = S.scan.deleted.filter(x => !ids.includes(x.id));
+        closeModal();
+        openUpdateProgress(result.data.type || "update");
+    } else if (result.error && result.error.code === "update_in_progress") {
+        toast(t("mods.scanJobBusy"), "warn");
+    } else if (result.error && result.error.code === "backup_busy") {
+        toast(t("upd.backupBusy"), "warn");
+    } else {
+        toast(result.error ? result.error.message : t("common.error"), "error");
+    }
+}
+
+/** Убрать записи из списка модпака — файлы уже отсутствуют на диске. */
+async function scanRemoveEntries(ids) {
+    const result = await api("mods/remove", { method: "POST", body: { profile: S.currentProfile, ids } });
+    if (result.ok) {
+        const removed = result.data.removed || ids;
+        S.scan.deleted = S.scan.deleted.filter(x => !removed.includes(x.id));
+        renderScanModal();
+        loadProfiles();
+        loadPack();
+    } else {
+        toast(result.error ? result.error.message : t("common.error"), "error");
+    }
+}
+
+/** Принять добавленные вручную файлы в состав: сопоставление по хэшам
+ *  Modrinth/CurseForge, без совпадения — локальная запись. */
+async function scanAdopt(files) {
+    const result = await api("mods/import", { method: "POST", body: { profile: S.currentProfile, files } });
+    if (!result.ok) {
+        if (result.error && result.error.code === "update_in_progress") {
+            toast(t("mods.scanJobBusy"), "warn");
+        } else {
+            toast(result.error ? result.error.message : t("common.error"), "error");
+        }
+        return;
+    }
+    const d = result.data;
+    toast(t("mods.importDone", {
+        imported: d.imported || 0,
+        local: d.local || 0,
+        skipped: d.skipped || 0,
+        failed: d.failed || 0,
+    }), (d.failed || 0) > 0 ? "warn" : "success");
+    const names = new Set(files.map(f => (f.kind || "mod") + ":" + f.name));
+    S.scan.added = S.scan.added.filter(f => !names.has((f.kind || "mod") + ":" + f.name));
+    renderScanModal();
+    loadProfiles();
+    loadPack();
+}
+
+/** Удалить добавленные вручную файлы с диска. */
+async function scanDeleteFiles(files) {
+    const result = await api("mods/clean", { method: "POST", body: { profile: S.currentProfile, files } });
+    if (result.ok) {
+        const names = new Set(files.map(f => (f.kind || "mod") + ":" + f.name));
+        S.scan.added = S.scan.added.filter(f => !names.has((f.kind || "mod") + ":" + f.name));
+        renderScanModal();
+        loadPack();
+    } else {
+        toast(result.error ? result.error.message : t("common.error"), "error");
+    }
 }
 
 /* ================= Загрузчик профиля и поиск по установленным ================= */
@@ -3195,7 +3363,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     // действия модпака
     on("btn-check", "click", checkUpdates);
     on("btn-update-all", "click", () => updateMods(null));
-    on("btn-apply", "click", applyComposition);
+    on("btn-scan", "click", openFolderScan);
     on("btn-rehash", "click", rehash);
     on("btn-reload-profile", "click", reloadProfile);
     // фильтры и сортировка списка модов (состояние — в localStorage)

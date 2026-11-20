@@ -54,8 +54,20 @@ with downloads and updates from **Modrinth** and **CurseForge**:
   INCLUDING non-standard profile.json forms (`optionalMods[].list` etc., which
   the launcher itself ignores) and entry-name matches — automatically become
   optional when the list is opened; diagnostics via `mods profile optionals`;
-- the **"Update hashes"** button — recalculates the profile HashedDir (same as
-  `sync`);
+- the **"Folder scan"** button — re-reads the content folders and shows where
+  they diverged from the modpack list: files deleted manually (restore =
+  download again, or remove from the list) and files added manually (adopt by
+  Modrinth/CurseForge hashes, or delete from disk); one item at a time or
+  the "remaining" bulk buttons;
+- **Minecraft color codes in file names** ("Pack &a.zip", "§c" — from
+  CurseForge resource pack titles; GravitLauncher chokes on them) are stripped
+  on every file-write path, and already present files are renamed
+  automatically during "Folder scan" and "Check updates" (the modpack entry's
+  file name and the updateOptional binding are updated together with the
+  file; "ATM&T.jar" is untouched — "T" is not a color code);
+- the **"Update hashes"** button — runs the console command
+  `config profileprovider sync`: a full "to be sure" sync — HashedDir of ALL
+  updates folders + re-reading the profile list from disk;
 - **hybrid authorization**: local accounts from the config + launcher accounts
   (admin detection via launcher permissions or your own SQL query, e.g. an
   `isAdmin` column);
@@ -229,9 +241,11 @@ alive without replacing the jar.
    disable toggles are gone — downloaded means needed: the whole modpack is
    the composition. Conflicting mods coexist peacefully; the launcher simply
    won't let a player enable both at once (the site only warns and highlights).
-5. **"Apply composition"** — downloads missing files and syncs the profile's
-   `updateOptional` with the composition (there are no "disabled" mods
-   anymore).
+5. **"Folder scan"** — compares the content folders with the modpack list:
+   files deleted manually ("Restore" = download again, or "Remove from
+   list") and files added manually ("Add to pack" by hashes, or "Delete
+   file"). Each item one by one, the rest — via the bulk "remaining"
+   buttons; while an update job runs, the scan buttons are disabled.
 6. **"Check updates"** — refreshes mod info AND checks sources for newer
    versions (don't want a specific version? use the per-mod **"Postpone"**
    button). **"Update all"** updates ONLY what the check found (plus mods
@@ -241,8 +255,9 @@ alive without replacing the jar.
    button: downloads already started are finished, queued ones are cancelled.
    If you reload or close the page mid-update, the window reopens by itself
    (the running job survives on the server).
-8. **"Update hashes"** — forced hash recalculation of the profile, after which
-   launcher clients sync files on next launch (download new ones and
+8. **"Update hashes"** — runs the `config profileprovider sync` command (a
+   full sync: hashes of all updates folders + re-reading the profiles), after
+   which launcher clients sync files on next launch (download new ones and
    **delete stale files**, including old mod versions).
 9. The update-check order (Modrinth/CurseForge), the number of **parallel
    downloads** and the **source response timeout** live on the **"Settings"**
@@ -1179,7 +1194,9 @@ Config (`mods.backup.*` in Config.json): `enabled` (true), `maxBackups` (30),
 ## Update progress (1.1.1)
 
 `POST /mods/api/mods/update` ("Update all" / per-mod "Update") and
-`POST /mods/api/mods/apply` ("Apply composition") no longer hang the request
+`POST /mods/api/mods/apply` (the apply-composition API — since 1.1.3 without
+a UI button: restoring missing files is the job of "Folder scan" and
+"Update") no longer hang the request
 until every download finishes. The server starts a **background job** and
 answers immediately; the admin UI opens a progress window and polls
 `GET /mods/api/mods/progress` every 0.7 s, so it is always visible:
@@ -1238,10 +1255,11 @@ session data.
 | POST | `/mods/api/mods/settings` | admin | mod settings (optional/channel/deps/conflicts/note) |
 | POST | `/mods/api/mods/skip` | admin | "Postpone"/clear it (`{profile,id,skip}`) |
 | POST | `/mods/api/mods/resolve-deps` | admin | re-link dependencies from the API |
-| POST | `/mods/api/mods/check` | admin | check updates (the response contains `updatesAvailable` and `relinked` — how many mods were re-linked to the priority source); 409 `update_in_progress` while a background update job runs |
+| POST | `/mods/api/mods/scan` | admin | "Folder scan": rename files with color codes (&a/§c) in names, respond `{renamed, deleted (files deleted manually, with a `canRestore` flag), added (files added manually)}`; handle items via `/mods/update`, `/mods/remove`, `/mods/import`, `/mods/clean` |
+| POST | `/mods/api/mods/check` | admin | check updates (the response contains `updatesAvailable`, `relinked` and `missingFiles` — how many entries have no file on disk); 409 `update_in_progress` while a background update job runs |
 | POST | `/mods/api/mods/update` | admin | start a **background** update job (mod(s)/all) — responds immediately with `{started:true, type:"update"}`; progress via `/mods/progress` (postponed mods are skipped, marked `postponed`) |
 | POST | `/mods/api/mods/update/stop` | admin | request stop of the running update job: started downloads finish, queued ones are cancelled; responds `{stopping:true}` |
-| POST | `/mods/api/mods/apply` | admin | start a **background** apply-composition job (download missing files, sync `updateOptional`); responds `{started:true, type:"apply"}`, progress via `/mods/progress` |
+| POST | `/mods/api/mods/apply` | admin | start a **background** apply-composition job (download missing files, sync `updateOptional`); responds `{started:true, type:"apply"}`, progress via `/mods/progress`. Since 1.1.3 the UI button is removed — the API is kept for compatibility |
 | GET | `/mods/api/mods/progress?profile=...` | admin | snapshot of the background update/apply job: `phase` (`preparing/checking/downloading/rehashing/done/error`), counters, per-mod status and downloaded bytes; `results` when finished |
 | GET | `/mods/api/mods/orphans?profile=` | admin | extra files (all content folders; response `{kind,name}[]`) |
 | POST | `/mods/api/mods/clean` | admin | delete extra files (`files` — objects `{name,kind}`; strings are treated as mods) |

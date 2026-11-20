@@ -254,31 +254,54 @@ public class LauncherAuthChecker {
     public String diagnose(String login) {
         StringBuilder out = new StringBuilder();
         out.append("adminCheck.type: ").append(config.launcherAuth.adminCheck.type).append('\n');
-        AuthProviderPair pair;
-        try {
-            pair = resolvePair();
-            out.append("auth pair: ").append(pair == null ? "null" : "ok").append('\n');
-        } catch (Throwable e) {
-            out.append("auth pair: ERROR — ").append(e.getMessage()).append('\n');
-            return out.toString();
-        }
-        if (pair == null || pair.core == null) {
-            out.append("auth core: not available\n");
-            return out.toString();
-        }
+        // server == null (диагностика вне живого сервера): auth core недоступен,
+        // но SQL-часть всё равно можно проверить — подставляем логин напрямую.
         User user;
-        try {
-            user = pair.core.getUserByUsername(login);
-        } catch (Throwable e) {
-            out.append("getUserByUsername('").append(login).append("'): ERROR — ")
-                    .append(e.getMessage()).append('\n');
-            return out.toString();
+        if (server == null) {
+            final String fallbackLogin = login;
+            user = new User() {
+                @Override
+                public String getUsername() {
+                    return fallbackLogin;
+                }
+
+                @Override
+                public java.util.UUID getUUID() {
+                    return null;
+                }
+
+                @Override
+                public ClientPermissions getPermissions() {
+                    return null;
+                }
+            };
+            out.append("auth core: недоступен (server == null) — проверяется только SQL-часть\n");
+        } else {
+            AuthProviderPair pair;
+            try {
+                pair = resolvePair();
+                out.append("auth pair: ").append(pair == null ? "null" : "ok").append('\n');
+            } catch (Throwable e) {
+                out.append("auth pair: ERROR — ").append(e.getMessage()).append('\n');
+                return out.toString();
+            }
+            if (pair == null || pair.core == null) {
+                out.append("auth core: not available\n");
+                return out.toString();
+            }
+            try {
+                user = pair.core.getUserByUsername(login);
+            } catch (Throwable e) {
+                out.append("getUserByUsername('").append(login).append("'): ERROR — ")
+                        .append(e.getMessage()).append('\n');
+                return out.toString();
+            }
+            if (user == null) {
+                out.append("getUserByUsername('").append(login).append("'): USER NOT FOUND\n");
+                return out.toString();
+            }
+            out.append("user found: ").append(user.getUsername()).append('\n');
         }
-        if (user == null) {
-            out.append("getUserByUsername('").append(login).append("'): USER NOT FOUND\n");
-            return out.toString();
-        }
-        out.append("user found: ").append(user.getUsername()).append('\n');
         String type = config.launcherAuth.adminCheck.type == null
                 ? "permissions" : config.launcherAuth.adminCheck.type.trim().toLowerCase();
         switch (type) {
