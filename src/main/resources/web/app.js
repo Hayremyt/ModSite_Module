@@ -79,6 +79,16 @@ async function resolveApiBase() {
     }
 }
 
+/**
+ * Иконки/превью Modrinth/CurseForge грузим через серверный прокси
+ * (GET api/icon?url=…): у части клиентов эти CDN заблокированы, а сервер
+ * доступен. Локальные/относительные пути остаются как есть.
+ */
+function iconSrc(url) {
+    if (!url || !/^https?:\/\//i.test(url)) return url;
+    return API_BASE + "icon?url=" + encodeURIComponent(url);
+}
+
 /** SVG-иконка из спрайта (стиль Lucide, без эмодзи). */
 function icon(name, cls) {
     return '<svg class="icon' + (cls ? " " + cls : "") + '" aria-hidden="true"><use href="#i-' + name + '"/></svg>';
@@ -648,7 +658,7 @@ function renderModCard(mod, byId, conflictIds, isAdmin) {
     // иконка (fallback при ошибке загрузки вешается ниже через addEventListener —
     // inline onerror с экранированием кавычек ломался, если имя начинается с "'")
     const iconHtml = mod.iconUrl
-        ? `<img class="mod-icon" src="${esc(mod.iconUrl)}" alt="" loading="lazy">`
+        ? `<img class="mod-icon" src="${esc(iconSrc(mod.iconUrl))}" alt="" loading="lazy">`
         : `<div class="mod-icon-fallback">${esc((mod.name || "?")[0].toUpperCase())}</div>`;
     // бейджи
     const badges = [];
@@ -1487,7 +1497,7 @@ function renderSearchCard(hit, isAdmin) {
     const card = document.createElement("div");
     card.className = "mod-card result-card";
     const iconHtml = hit.iconUrl
-        ? `<img class="mod-icon" src="${esc(hit.iconUrl)}" alt="" loading="lazy">`
+        ? `<img class="mod-icon" src="${esc(iconSrc(hit.iconUrl))}" alt="" loading="lazy">`
         : `<div class="mod-icon-fallback">${esc((hit.title || "?")[0].toUpperCase())}</div>`;
     const badges = [`<span class="badge ${hit.source === "modrinth" ? "mr" : "cf"}">${hit.source === "modrinth" ? "Modrinth" : "CurseForge"}</span>`];
     const kind = S.search.type || "mod";
@@ -2422,7 +2432,7 @@ function renderSuggestTable() {
         const tr = document.createElement("tr");
         const kindIcon = item.kind === "resourcepack" ? "image" : item.kind === "shader" ? "sparkles" : "package";
         const iconHtml = item.iconUrl
-            ? `<img class="suggest-icon" src="${esc(item.iconUrl)}" alt="" loading="lazy">`
+            ? `<img class="suggest-icon" src="${esc(iconSrc(item.iconUrl))}" alt="" loading="lazy">`
             : `<div class="mod-icon-fallback small-fallback">${esc((item.title || "?")[0].toUpperCase())}</div>`;
         tr.innerHTML = `<td>${esc(item.login)}</td>
             <td><span class="badge kind-${esc(item.kind || "mod")}">${icon(kindIcon)}${esc(t("kind." + (item.kind || "mod")))}</span></td>

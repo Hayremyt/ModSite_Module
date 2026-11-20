@@ -48,7 +48,15 @@ public class AuthService {
         }
     }
 
-    private final ModsSiteConfig config;
+    // ВОЛАТИЛЬНО + сеттер: JsonConfigurable.loadConfig() подменяет объект
+    // конфига НОВЫМ экземпляром при каждой живой перезагрузке (mods reload или
+    // правка Config.json на диске). Без сеттера логин навсегда работал бы по
+    // СТАРОМУ экземпляру: auth.mode, onlyAdminsCanLogin, treatNonAdminAs,
+    // superAdmins, extraTotp, adminCheck — всё игнорировало бы правки конфига
+    // без перезапуска сервера (симптом: «поменял query на is_admin — все равно
+    // viewer»: сервер выполнял старый запрос SELECT isAdmin, он падал с SQL-
+    // ошибкой и все админы БД считались viewer).
+    private volatile ModsSiteConfig config;
     private final IpBanManager ipBans;
     private final LauncherAuthChecker launcherAuth;
 
@@ -56,6 +64,11 @@ public class AuthService {
         this.config = config;
         this.ipBans = ipBans;
         this.launcherAuth = launcherAuth;
+    }
+
+    /** Подменить конфиг после reloadConfig (см. ModsSiteModule.reloadConfig). */
+    public void setConfig(ModsSiteConfig config) {
+        this.config = config;
     }
 
     /**

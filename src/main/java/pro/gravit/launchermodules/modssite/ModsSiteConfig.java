@@ -140,6 +140,29 @@ public class ModsSiteConfig {
             }
             mods.updateSourcePriority = sanitized;
         }
+        // санитизация прокси-доменов картинок: trim/кавычки/регистр, допускается
+        // вставка с «https://» и путём — берём только host; без пустых и дублей
+        if (mods.iconProxyHosts == null) {
+            mods.iconProxyHosts = new ArrayList<>(List.of(
+                    "cdn.modrinth.com", "media.forgecdn.net", "media.curseforge.com", "cdn.forgecdn.net"));
+        }
+        {
+            List<String> sanitized = new ArrayList<>();
+            for (String raw : mods.iconProxyHosts) {
+                if (raw == null) continue;
+                String host = stripKeyNoise(raw).toLowerCase();
+                if (host.contains("://") || host.contains("/")) {
+                    try {
+                        java.net.URI uri = java.net.URI.create(host.contains("://") ? host : "https://" + host);
+                        if (uri.getHost() != null) host = uri.getHost().toLowerCase();
+                    } catch (Exception ignored) {
+                    }
+                }
+                if (host.isEmpty() || host.length() > 253) continue;
+                if (!sanitized.contains(host)) sanitized.add(host);
+            }
+            mods.iconProxyHosts = sanitized;
+        }
         // «грязный» ключ (пробелы/кавычки при вставке) CurseForge молча отвечает 403 —
         // чистим заранее
         if (mods.curseforge.apiKey != null) {
@@ -784,6 +807,17 @@ public class ModsSiteConfig {
         public int httpTimeoutSeconds = 30;
         /** Параллельные загрузки файлов. */
         public int maxConcurrentDownloads = 4;
+        /**
+         * Проксировать картинки (иконки/превью проектов) через сервер.
+         * Браузер грузил их напрямую с cdn.modrinth.com / media.forgecdn.net —
+         * у пользователей с заблокированным доступом к этим CDN иконки не
+         * открывались. Прокси отдаёт картинку с домена сайта: сервер сам
+         * запрашивает её и кэширует на диск (GET /api/icon?url=...).
+         */
+        public boolean iconProxyEnabled = true;
+        /** Домены, с которых прокси разрешено отдавать картинки (поддомены тоже разрешены). */
+        public List<String> iconProxyHosts = new ArrayList<>(List.of(
+                "cdn.modrinth.com", "media.forgecdn.net", "media.curseforge.com", "cdn.forgecdn.net"));
         /** Автоматически подтягивать зависимости и конфликты при добавлении мода. */
         public boolean autoResolveDeps = true;
         /** Опциональные моды по умолчанию включены в сборку. */

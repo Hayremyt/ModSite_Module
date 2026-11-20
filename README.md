@@ -680,9 +680,9 @@ empty = the default pair). Which of them is an admin is decided by
   "adminCheck": {
     "type": "sql",
     "sql": {
-      "url": "",   // empty = reuse the connection settings from the launcher's SQL provider
-      "user": "",
-      "password": "",
+      "url": "jdbc:mysql://127.0.0.1:3306/launcher?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC",
+      "user": "launcher",
+      "password": "database password",
       "query": "SELECT isAdmin FROM users WHERE username = ?",
       "params": ["{login}"],
       "trueValues": ["1", "true", "t", "yes", "y", "admin"]
@@ -691,6 +691,12 @@ empty = the default pair). Which of them is an admin is decided by
   "treatNonAdminAs": "viewer"
 }
 ```
+
+`url` is a regular JDBC URL. For MySQL:
+`jdbc:mysql://host:3306/database?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC`.
+The MySQL driver (`mysql-connector-j`) ships with LaunchServer in `lib/` —
+nothing extra to install. Leave `url` empty to reuse the connection settings
+of the launcher's SQL provider (then `user`/`password` are not needed either).
 
 Substitutions in `params`: `{login}`, `{uuid}`, `{username}`. The first
 column of the first row is compared to `trueValues` (case-insensitive).
@@ -1054,6 +1060,11 @@ hand, then `mods reload` or a restart).
     "cacheTtlMinutes": 10,              // source API response cache
     "httpTimeoutSeconds": 30,
     "maxConcurrentDownloads": 4,
+    "iconProxyEnabled": true,           // serve Modrinth/CF icons via the server
+                                        // (these CDNs are blocked for some clients;
+                                        // disk cache: config/ModsSite/iconcache)
+    "iconProxyHosts": ["cdn.modrinth.com", "media.forgecdn.net",
+                       "media.curseforge.com", "cdn.forgecdn.net"],  // subdomains allowed too
     "autoResolveDeps": true,            // auto-link dependencies/conflicts
     "defaultOptionalEnabled": true,     // optional mods enabled for players by default (mark in updateOptional)
     "syncProfileOptional": true,        // sync optional mods with the profile's

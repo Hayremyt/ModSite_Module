@@ -683,9 +683,9 @@ modId из jar сохраняется в модпаке (`installedModId`), а �
   "adminCheck": {
     "type": "sql",
     "sql": {
-      "url": "",   // пусто = переиспользовать настройки соединения из SQL-провайдера лаунчера
-      "user": "",
-      "password": "",
+      "url": "jdbc:mysql://127.0.0.1:3306/launcher?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC",
+      "user": "launcher",
+      "password": "пароль от БД",
       "query": "SELECT isAdmin FROM users WHERE username = ?",
       "params": ["{login}"],
       "trueValues": ["1", "true", "t", "yes", "y", "admin"]
@@ -695,8 +695,38 @@ modId из jar сохраняется в модпаке (`installedModId`), а �
 }
 ```
 
+`url` — обычный JDBC-URL. Для MySQL:
+`jdbc:mysql://хост:3306/имя_базы?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC`.
+Драйвер (`mysql-connector-j`) уже есть в `lib/` сборки LaunchServer — ничего
+дополнительно ставить не надо. Оставьте `url` пустым, чтобы модуль переиспользовал
+настройки соединения из SQL-провайдера лаунчера (тогда `user`/`password` тоже
+не нужны).
+
 Подстановки в `params`: `{login}`, `{uuid}`, `{username}`. Первый столбец
 первой строки сравнивается с `trueValues` (без учёта регистра).
+
+**Важно**: настройки `auth`, `launcherAuth` и `superAdmins` применяются при
+живой перезагрузке конфига так же, как и остальные (правка Config.json на
+диске или `mods reload`) — перезапуск сервера не нужен. В версиях до 1.1.2
+эти настройки после reload не подхватывались (выполнялся старый SQL-запрос,
+и админы БД ошибочно виделись как viewer).
+
+**Все админы БД видятся как viewer — что проверить** (запустите
+`mods checkadmin <логин>` — команда печатает каждый шаг и текст ошибки):
+
+1. `adminCheck.type` действительно `"sql"` (по умолчанию `permissions` —
+   тогда смотрятся колонки perms/roles, а не ваша колонка);
+2. запрос возвращает строку: 0 строк = не то имя таблицы/колонки в WHERE;
+3. сырой первый столбец совпадает с `trueValues` (для INT/BIT обычно `1` —
+   оно в списке по умолчанию; MySQL-драйвер может вернуть и `true` —
+   тоже в списке);
+4. число `?` в запросе равно длине `params`;
+5. в логе сервера ищите `sql adminCheck failed` — там стек полной ошибки
+   (например `Unknown column 'isAdmin'` при несовпадении имени колонки).
+
+Кроме того: если суперадмин включал для логина пометку «наблюдатель»
+(«Безопасность → Роли», файл `admin-roles.json`), она действует ПОВЕРХ
+результата проверки БД — снимается кнопкой «Вернуть роль».
 
 - `treatNonAdminAs`: `viewer` (только чтение) или `deny` (вход запрещён).
 - `auth.onlyAdminsCanLogin: true` — сайт пускает **только админов** (локальные
@@ -890,6 +920,10 @@ mods bans                                — активные баны IP и б�
 mods unban <ip> | account <логин>
 mods rehash [profile|all]                — пересчитать хэши (кнопка на сайте)
 mods check [profile]                     — проверить обновления модов
+mods checkadmin <логин>                  — диагностика признака админа у учётки
+                                           лаунчера (permissions/sql): печатает
+                                           запрос, сырое значение из БД, текст
+                                           SQL-ошибки, итог: ADMIN / NOT admin
 mods reload                              — перечитать конфиг модуля
 mods site                                — статус сайта (вкл/выкл)
 mods site on                             — включить сайт (алиас: enable)
@@ -1049,6 +1083,11 @@ mods profile optionals [profile]         — ДИАГНОСТИКА ОПЦИОН
     "cacheTtlMinutes": 10,              // кэш ответов API источников
     "httpTimeoutSeconds": 30,
     "maxConcurrentDownloads": 4,
+    "iconProxyEnabled": true,           // иконки/превью Modrinth/CF отдаёт сервер
+                                        // (у клиентов эти CDN бывают заблокированы;
+                                        // кэш на диске: config/ModsSite/iconcache)
+    "iconProxyHosts": ["cdn.modrinth.com", "media.forgecdn.net",
+                       "media.curseforge.com", "cdn.forgecdn.net"],  // поддомены тоже разрешены
     "autoResolveDeps": true,            // автопривязка зависимостей/конфликтов
     "defaultOptionalEnabled": true,     // опциональные включены игрокам по умолчанию (mark в updateOptional)
     "syncProfileOptional": true,        // синхронизация опциональных модов с

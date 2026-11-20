@@ -403,6 +403,10 @@ public class ModsWebSeverlet implements NettyWebAPIHandler.SimpleSeverletHandler
                 if (!isPost) withSession(req, false, false, (session) -> handleCategories(req));
                 else sendJson(req, HttpResponseStatus.METHOD_NOT_ALLOWED, error("method", "GET only"));
             }
+            case "/api/icon" -> {
+                if (!isPost) withSession(req, false, false, (session) -> handleIconProxy(req));
+                else sendJson(req, HttpResponseStatus.METHOD_NOT_ALLOWED, error("method", "GET only"));
+            }
             case "/api/mods/suggest" -> {
                 if (isPost) withSession(req, false, true, (session) -> handleSuggest(req, ip, session));
                 else sendJson(req, HttpResponseStatus.METHOD_NOT_ALLOWED, error("method", "POST only"));
@@ -2766,6 +2770,45 @@ public class ModsWebSeverlet implements NettyWebAPIHandler.SimpleSeverletHandler
      *  мегабайты), а неограниченное чтение в память — риск OOM; большие архивы
      *  забираются с сервера напрямую из config/ModsSite/backups/. */
     private static final long MAX_BACKUP_DOWNLOAD_BYTES = 128L * 1024 * 1024;
+
+    /**
+     * GET /api/icon?url=... — прокси картинок Modrinth/CurseForge.
+     * Браузер грузил иконки напрямую с cdn.modrinth.com / media.forgecdn.net —
+     * у пользователей с заблокированным доступом к этим CDN они не открывались.
+     * Теперь картинка качается сервером (он доступен к источникам) и отдаётся
+     * с домена сайта, из кэша на диске (IconProxyService).
+     */
+    private void handleIconProxy(WebRequest req) {
+        if (!config().mods.iconProxyEnabled || module.iconProxy == null) {
+            sendJson(req, HttpResponseStatus.NOT_FOUND, error("not_found", "Icon proxy disabled"));
+            return;
+        }
+        String url = req.query("url");
+        if (url == null || url.isBlank()) {
+            sendJson(req, HttpResponseStatus.BAD_REQUEST, error("bad_request", "url required"));
+            return;
+        }
+        IconProxyService.Result result;
+        try {
+            result = module.iconProxy.get(url);
+        } catch (IconProxyService.IconProxyException e) {
+            sendJson(req, HttpResponseStatus.BAD_GATEWAY,
+                    error("icon_fetch_failed", String.valueOf(e.getMessage())));
+            return;
+        } catch (Throwable e) {
+            module.logger.warn("Icon proxy failed", e);
+            sendJson(req, HttpResponseStatus.BAD_GATEWAY, error("icon_fetch_failed", "Cannot fetch icon"));
+            return;
+        }
+        DefaultFullHttpResponse response = new DefaultFullHttpResponse(HttpVersion.HTTP_1_1,
+                HttpResponseStatus.OK, Unpooled.wrappedBuffer(result.body()));
+        response.headers().set(HttpHeaderNames.CONTENT_TYPE, result.contentType());
+        response.headers().setInt(HttpHeaderNames.CONTENT_LENGTH, result.body().length);
+        // Иконки стабильны: день в браузере, сутки на диске сервера
+        response.headers().set(HttpHeaderNames.CACHE_CONTROL, "public, max-age=86400");
+        applySecurityHeaders(response);
+        req.ctx.writeAndFlush(response).addListener(io.netty.channel.ChannelFutureListener.CLOSE);
+    }
 
     private void handleBackupDownload(WebRequest req, String ip, SessionManager.Session session) {
         String id = req.query("id");

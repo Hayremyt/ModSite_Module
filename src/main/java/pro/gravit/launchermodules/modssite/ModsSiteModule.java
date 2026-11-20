@@ -24,6 +24,7 @@ import pro.gravit.launchermodules.modssite.mods.UpdateService;
 import pro.gravit.launchermodules.modssite.security.AuditLogger;
 import pro.gravit.launchermodules.modssite.security.IpBanManager;
 import pro.gravit.launchermodules.modssite.security.RateLimiter;
+import pro.gravit.launchermodules.modssite.web.IconProxyService;
 import pro.gravit.launchermodules.modssite.web.ModsWebSeverlet;
 import pro.gravit.launchermodules.modssite.web.StaticResources;
 import pro.gravit.launchermodules.modssite.web.WebResourcesManager;
@@ -48,8 +49,8 @@ import java.util.concurrent.TimeUnit;
  * (эскалация банов IP, whitelist/blacklist), TOTP, аудит.
  */
 public class ModsSiteModule extends LauncherModule {
-    public static final Version version = new Version(1, 1, 1, 0, Version.Type.LTS);
-    public final String versionString = "1.1.1";
+    public static final Version version = new Version(1, 1, 2, 0, Version.Type.LTS);
+    public final String versionString = "1.1.2";
     public final Logger logger = LogManager.getLogger(ModsSiteModule.class);
 
     // Состояние и сервисы (инициализируются в init)
@@ -78,6 +79,8 @@ public class ModsSiteModule extends LauncherModule {
     public ModrinthApiProvider modrinthProvider;
     public CurseForgeApiProvider curseforgeProvider;
     public BackupService backups;
+    /** Прокси картинок Modrinth/CurseForge (иконки грузятся с домена сайта). */
+    public IconProxyService iconProxy;
     /** Сервлет на /mods (сайт + API по пути /mods). */
     public NettyWebAPIHandler.SeverletPathPair severletPair;
     /** Сервлет в корне "/" (root-режим для доменов из web.siteDomains):
@@ -202,6 +205,10 @@ public class ModsSiteModule extends LauncherModule {
         suggestions = new SuggestionService(configDir.resolve("suggestions.json"));
         backups = new BackupService(config, modpacks, updates, audit,
                 configDir.resolve("backups"), versionString);
+        // Прокси картинок: у части клиентов CDN Modrinth/CurseForge заблокированы,
+        // иконки/превью теперь отдаются сервером (GET /api/icon?url=...) из кэша на диске
+        iconProxy = new IconProxyService(this, configDir.resolve("iconcache"));
+        iconProxy.sweep();
         // 4. Команды
         server.commandHandler.registerCommand("mods", new ModsCommand(server, this));
         // 5. Веб
@@ -267,6 +274,7 @@ public class ModsSiteModule extends LauncherModule {
                     ipBans.tick();
                     sessions.purgeExpired();
                     rateLimiter.sweep();
+                    iconProxy.sweep();
                 } catch (Throwable t) {
                     logger.debug("Maintenance error", t);
                 }
@@ -373,6 +381,12 @@ public class ModsSiteModule extends LauncherModule {
         saveConfig();
         ipBans.setConfig(config);
         sessions.setConfig(config);
+        // Auth-сервисы тоже держали ссылку на СТАРЫЙ экземпляр конфига:
+        // правки launcherAuth.adminCheck (type=sql, query, url, trueValues),
+        // auth.mode, superAdmins, extraTotp не применялись при reloadConfig —
+        // выполнялся прежний SQL-запрос, и все админы из БД получали viewer.
+        if (launcherAuthChecker != null) launcherAuthChecker.setConfig(config);
+        if (authService != null) authService.setConfig(config);
         audit.setEnabled(config.audit.enabled);
         enabled = config.enabled;
         // КРИТИЧНО: сервисы и провайдеры держали ссылки на под-конфиги СТАРОГО

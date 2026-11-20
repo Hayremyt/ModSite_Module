@@ -37,6 +37,7 @@ public class ModsCommand extends Command {
         childCommands.put("unban", new UnbanCommand(server, module));
         childCommands.put("rehash", new RehashCommand(server, module));
         childCommands.put("check", new CheckCommand(server, module));
+        childCommands.put("checkadmin", new CheckAdminCommand(server, module));
         childCommands.put("reload", new ReloadCommand(server, module));
         childCommands.put("sessions", new SessionsCommand(server, module));
         childCommands.put("site", new SiteCommand(server, module));
@@ -47,7 +48,7 @@ public class ModsCommand extends Command {
 
     @Override
     public String getArgsDescription() {
-        return "[status|user|whitelist|blacklist|bans|unban|rehash|check|reload|sessions|site|web|curseforge|profile] [args]";
+        return "[status|user|whitelist|blacklist|bans|unban|rehash|check|checkadmin|reload|sessions|site|web|curseforge|profile] [args]";
     }
 
     @Override

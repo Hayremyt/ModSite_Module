@@ -57,7 +57,14 @@ public class LauncherAuthChecker {
     }
 
     private final LaunchServer server;
-    private final ModsSiteConfig config;
+    // ВОЛАТИЛЬНО + сеттер: при живой перезагрузке конфига (mods reload или
+    // правка Config.json на диске) модуль подменяет объект ModsSiteConfig
+    // НОВЫМ экземпляром (JsonConfigurable.loadConfig -> setConfig). Если бы
+    // ссылка оставалась захваченной при старте, adminCheck (тип, query, url,
+    // trueValues...) навсегда читался бы из СТАРОГО экземпляра — правка
+    // «SELECT isAdmin» на «SELECT is_admin» не применялась бы без перезапуска,
+    // а упавший запрос ловился в catch и отдавал viewer для всех админов БД.
+    private volatile ModsSiteConfig config;
     private volatile String cachedSqlUrl;
     private volatile String cachedSqlUser;
     private volatile String cachedSqlPassword;
@@ -65,6 +72,16 @@ public class LauncherAuthChecker {
     public LauncherAuthChecker(LaunchServer server, ModsSiteConfig config) {
         this.server = server;
         this.config = config;
+    }
+
+    /** Подменить конфиг после reloadConfig (см. ModsSiteModule.reloadConfig). */
+    public void setConfig(ModsSiteConfig config) {
+        this.config = config;
+        // Отражённое соединение могло поменяться (другой auth-провайдер в
+        // LaunchServer.json) — кэш url/user/password пересобираем заново.
+        cachedSqlUrl = null;
+        cachedSqlUser = null;
+        cachedSqlPassword = null;
     }
 
     public AuthProviderPair resolvePair() {
@@ -221,9 +238,124 @@ public class LauncherAuthChecker {
             }
             return false;
         } catch (Exception e) {
-            logger.error("sql adminCheck failed for '{}'", user.getUsername(), e);
+            logger.error("sql adminCheck failed for '{}' (check query/table/column "
+                    + "names, params count; diagnostics: mods checkadmin {})",
+                    user.getUsername(), user.getUsername(), e);
             return false;
         }
+    }
+
+    /**
+     * Диагностика adminCheck для команды «mods checkadmin &lt;логин&gt;»:
+     * выполняет те же шаги, что и живая проверка роли, и печатает каждый шаг
+     * (пара, пользователь, тип проверки, запрос, сырое значение первого
+     * столбца, совпадение с trueValues или текст ошибки SQL).
+     */
+    public String diagnose(String login) {
+        StringBuilder out = new StringBuilder();
+        out.append("adminCheck.type: ").append(config.launcherAuth.adminCheck.type).append('\n');
+        AuthProviderPair pair;
+        try {
+            pair = resolvePair();
+            out.append("auth pair: ").append(pair == null ? "null" : "ok").append('\n');
+        } catch (Throwable e) {
+            out.append("auth pair: ERROR — ").append(e.getMessage()).append('\n');
+            return out.toString();
+        }
+        if (pair == null || pair.core == null) {
+            out.append("auth core: not available\n");
+            return out.toString();
+        }
+        User user;
+        try {
+            user = pair.core.getUserByUsername(login);
+        } catch (Throwable e) {
+            out.append("getUserByUsername('").append(login).append("'): ERROR — ")
+                    .append(e.getMessage()).append('\n');
+            return out.toString();
+        }
+        if (user == null) {
+            out.append("getUserByUsername('").append(login).append("'): USER NOT FOUND\n");
+            return out.toString();
+        }
+        out.append("user found: ").append(user.getUsername()).append('\n');
+        String type = config.launcherAuth.adminCheck.type == null
+                ? "permissions" : config.launcherAuth.adminCheck.type.trim().toLowerCase();
+        switch (type) {
+            case "permissions" -> {
+                ClientPermissions permissions = user.getPermissions();
+                out.append("permissions: ").append(permissions == null ? "null" : "present").append('\n');
+                String perm = config.launcherAuth.adminCheck.permission;
+                String role = config.launcherAuth.adminCheck.role;
+                out.append("hasPerm('").append(perm).append("'): ")
+                        .append(perm != null && permissions != null && permissions.hasPerm(perm)).append('\n');
+                out.append("hasRole('").append(role).append("'): ")
+                        .append(role != null && permissions != null && permissions.hasRole(role)).append('\n');
+            }
+            case "sql" -> {
+                ModsSiteConfig.SqlAdminCheck sql = config.launcherAuth.adminCheck.sql;
+                if (sql == null || sql.query == null || sql.query.isBlank()) {
+                    out.append("sql: query is EMPTY\n");
+                    return out.toString();
+                }
+                out.append("query: ").append(sql.query).append('\n');
+                out.append("params: ").append(sql.params).append('\n');
+                out.append("trueValues: ").append(sql.trueValues).append('\n');
+                String url = sql.url;
+                if (url == null || url.isBlank()) {
+                    if (cachedSqlUrl == null) fillFromLauncherSqlSource();
+                    url = cachedSqlUrl;
+                    out.append("url: (empty in config) — reusing launcher SQL source: ")
+                            .append(url == null ? "NOT FOUND" : "found").append('\n');
+                } else {
+                    out.append("url: set in config\n");
+                }
+                if (url == null || url.isBlank()) return out.toString();
+                try (Connection connection = DriverManager.getConnection(url,
+                        sql.url == null || sql.url.isBlank() ? cachedSqlUser : sql.user,
+                        sql.url == null || sql.url.isBlank() ? cachedSqlPassword : sql.password);
+                     PreparedStatement statement = connection.prepareStatement(sql.query)) {
+                    List<String> params = sql.params;
+                    if (params != null) {
+                        for (int i = 0; i < params.size(); i++) {
+                            String resolved = resolveParam(params.get(i), user);
+                            statement.setString(i + 1, resolved);
+                            out.append("param ").append(i + 1).append(": ")
+                                    .append(params.get(i)).append(" -> '").append(resolved).append("'\n");
+                        }
+                    }
+                    try (ResultSet rs = statement.executeQuery()) {
+                        if (rs.next()) {
+                            String value = rs.getString(1);
+                            out.append("row 1, column 1 raw value: '").append(value).append('\'');
+                            if (value == null) {
+                                out.append(" (NULL — не совпадает ни с одним trueValue)\n");
+                            } else {
+                                boolean match = sql.trueValues != null && sql.trueValues.stream()
+                                        .anyMatch(v -> v.equalsIgnoreCase(value.trim()));
+                                out.append(match ? " — MATCHES trueValues\n" : " — does NOT match trueValues\n");
+                                out.append("  (trimmed value: '").append(value.trim()).append("')\n");
+                            }
+                        } else {
+                            out.append("query returned 0 rows — проверьте имя таблицы и условие WHERE\n");
+                        }
+                    }
+                } catch (Exception e) {
+                    out.append("SQL ERROR: ").append(e.getClass().getSimpleName()).append(": ")
+                            .append(e.getMessage()).append('\n');
+                }
+            }
+            default -> out.append("type '").append(type).append("' — все аккаунты лаунчера НЕ админы\n");
+        }
+        boolean admin;
+        try {
+            admin = isAdmin(user);
+        } catch (Throwable e) {
+            out.append("adminCheck: ERROR — ").append(e.getMessage()).append('\n');
+            return out.toString();
+        }
+        out.append("RESULT: ").append(admin ? "ADMIN" : "NOT admin (viewer)").append('\n');
+        return out.toString();
     }
 
     private String resolveParam(String param, User user) {
