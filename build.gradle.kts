@@ -3,7 +3,7 @@ plugins {
 }
 
 group = "pro.gravit.launchermodules"
-version = "1.1.3"
+version = "1.1.4"
 
 // Toolchain 21 — как LaunchServer 5.7.x: его jar'ы в lib/ собраны байткодом
 // Java 21, и javac более старого JDK не может их читать ("class file has wrong

@@ -284,13 +284,64 @@ public class ModsWebSeverlet implements NettyWebAPIHandler.SimpleSeverletHandler
      *  disabled, custom} — конфигурация тем оформления. Отдаётся без сессии
      *  (нужен уже на экране входа) и без кэша (no-store), чтобы смена тем
      *  админом подхватывалась при следующей загрузке страницы. */
+    /** 1.1.4: boot-скрипт применения темы до первой отрисовки. Живёт здесь,
+     *  в динамическом theme.js, а не инлайном в index.html: CSP сервера —
+     *  script-src 'self', инлайн-скрипты браузер блокирует (была вспышка
+     *  дефолтной темы + ошибка в консоли на каждом открытии). theme.js
+     *  грузится в <head> до статики и выполняется до первой отрисовки. */
+    private static final String THEME_BOOT_JS = """
+(function () {
+    var IDS = ["glass", "comic", "simple", "neon", "pixel", "terminal"];
+    var M = window.MODS_THEMES || {};
+    var dis = M.disabled || [];
+    var customs = M.custom || [];
+    function available(t) {
+        if (!t) return false;
+        if (IDS.indexOf(t) >= 0) return dis.indexOf(t) < 0;
+        for (var i = 0; i < customs.length; i++) {
+            if (customs[i] && ("c-" + customs[i].id) === t) return true;
+        }
+        return false;
+    }
+    var def = available(M.defaultTheme) ? M.defaultTheme : "glass";
+    var defMode = M.defaultMode === "light" ? "light" : "dark";
+    var t = null, m = null;
+    try {
+        var q = new URLSearchParams(location.search);
+        t = q.get("theme");
+        m = q.get("mode");
+        var saved = localStorage.getItem("mods_theme");
+        var savedMode = localStorage.getItem("mods_mode");
+        if (available(t)) {
+            if (m !== "light" && m !== "dark") m = (savedMode === "light" || savedMode === "dark") ? savedMode : defMode;
+        } else {
+            t = available(saved) ? saved : def;
+            m = (savedMode === "light" || savedMode === "dark") ? savedMode : defMode;
+        }
+    } catch (e) {
+        t = def;
+        m = defMode;
+    }
+    document.documentElement.setAttribute("data-theme", t);
+    document.documentElement.setAttribute("data-mode", m);
+    var METAS = { glass: ["#E9F0F9", "#0F172A"], comic: ["#FBEFD3", "#211A10"],
+        simple: ["#F5F6F8", "#101318"], neon: ["#F2FDFF", "#05070E"],
+        pixel: ["#E7E9DC", "#23252B"], terminal: ["#F3F7EE", "#020A04"] };
+    var meta = document.querySelector('meta[name="theme-color"]');
+    if (meta && METAS[t]) meta.setAttribute("content", m === "light" ? METAS[t][0] : METAS[t][1]);
+    var scheme = document.querySelector('meta[name="color-scheme"]');
+    if (scheme) scheme.setAttribute("content", m);
+})();
+""";
+
     private void serveThemeJs(WebRequest req) {
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("defaultTheme", config().themes.defaultTheme);
         payload.put("defaultMode", config().themes.defaultMode);
         payload.put("disabled", config().themes.disabled);
         payload.put("custom", customThemesView());
-        byte[] body = ("window.MODS_THEMES=" + Launcher.gsonManager.gson.toJson(payload) + ";")
+        byte[] body = ("window.MODS_THEMES=" + Launcher.gsonManager.gson.toJson(payload) + ";\n"
+                + THEME_BOOT_JS)
                 .getBytes(java.nio.charset.StandardCharsets.UTF_8);
         DefaultFullHttpResponse response = new DefaultFullHttpResponse(HttpVersion.HTTP_1_1,
                 HttpResponseStatus.OK, Unpooled.wrappedBuffer(body));

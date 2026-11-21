@@ -30,6 +30,7 @@ const I18N = {
         "backups.foreignBadge": "чужой mrpack",
         "backups.totalSize": "Общий размер:",
         "backups.create": "Создать бекап",
+        "backups.creating": "Создаётся…",
         "backups.namePlaceholder": "Имя бекапа (по умолчанию — дата и время)",
         "backups.foldersTitle": "Папки бекапа",
         "backups.foldersHint": "Что попадёт в бекап: отметьте галочками папки из папки сборки профиля. «По умолчанию» — три стандартные папки контента (mods, resourcepacks, shaderpacks с учётом ваших переопределений).",
@@ -140,6 +141,7 @@ const I18N = {
         "mods.scanJobBusy": "Идёт задача обновления — дождитесь окончания",
         "mods.scanNoSource": "восстановить нечем (локальный файл)",
         "upd.title": "Обновление модов",
+        "upd.elapsed": "Время выполнения",
         "upd.preparing": "Подготовка…",
         "upd.checking": "Проверка обновлений",
         "upd.downloading": "Скачивание",
@@ -255,6 +257,7 @@ const I18N = {
         "settings.suggestBanned": "Без права предлагать",
         "settings.suggestBannedHint": "логины, которым кнопка «Предложить» недоступна",
         "settings.suggestBanLogin": "логин",
+        "settings.suggestNoBans": "никто не ограничен — предложить может любой наблюдатель",
         "suggest.button": "Предложить",
         "suggest.suggestedBadge": "Предложено",
         "suggest.done": "Предложение отправлено — ждёт решения администратора",
@@ -296,6 +299,9 @@ const I18N = {
         "theme.dark": "Тёмный",
         "theme.configure": "Настроить темы…",
         "common.cancel": "Отмена",
+        "common.ok": "ОК",
+        "common.close": "Закрыть",
+        "common.confirmTitle": "Подтверждение",
         "settings.appearance": "Оформление",
         "settings.consoleTitle": "Вывод в консоль сервера",
         "settings.consoleLevel": "Уровень логов модуля",
@@ -456,6 +462,7 @@ const I18N = {
         "backups.foreignBadge": "foreign mrpack",
         "backups.totalSize": "Total size:",
         "backups.create": "Create backup",
+        "backups.creating": "Creating…",
         "backups.namePlaceholder": "Backup name (defaults to date and time)",
         "backups.foldersTitle": "Backup folders",
         "backups.foldersHint": "What gets backed up: tick the folders from the profile build folder. “Default” means the three standard content folders (mods, resourcepacks, shaderpacks, respecting your overrides).",
@@ -566,6 +573,7 @@ const I18N = {
         "mods.scanJobBusy": "An update job is running — wait for it to finish",
         "mods.scanNoSource": "cannot be restored (local file)",
         "upd.title": "Updating mods",
+        "upd.elapsed": "Elapsed time",
         "upd.preparing": "Preparing…",
         "upd.checking": "Checking for updates",
         "upd.downloading": "Downloading",
@@ -764,6 +772,7 @@ const I18N = {
         "settings.suggestBanned": "Not allowed to suggest",
         "settings.suggestBannedHint": "logins with the Suggest button disabled",
         "settings.suggestBanLogin": "login",
+        "settings.suggestNoBans": "no one is restricted — any viewer can suggest",
         "suggest.button": "Suggest",
         "suggest.suggestedBadge": "Suggested",
         "suggest.done": "Suggestion sent — waiting for the admin's decision",
@@ -805,6 +814,9 @@ const I18N = {
         "theme.dark": "Dark",
         "theme.configure": "Customize themes…",
         "common.cancel": "Cancel",
+        "common.ok": "OK",
+        "common.close": "Close",
+        "common.confirmTitle": "Confirm",
         "settings.appearance": "Appearance",
         "settings.consoleTitle": "Server console output",
         "settings.consoleLevel": "Module log level",
@@ -899,4 +911,30 @@ function t(key, params) {
         }
     }
     return s;
+}
+
+/** 1.1.4: pl(n, key) — существительное согласуется с числом («1 мод»,
+ *  «2 мода», «5 модов»; раньше любые числа давали «N модов»). Для остальных
+ *  языков — единственное/множественное число. */
+const PL_RU = {
+    "stats.mods": ["мод", "мода", "модов"],
+    "stats.resourcepacks": ["ресурспак", "ресурспака", "ресурспаков"],
+    "stats.shaders": ["шейдер", "шейдера", "шейдеров"],
+    "stats.updates": ["обновление", "обновления", "обновлений"],
+};
+const PL_EN_ONE = {
+    "stats.mods": "mod", "stats.resourcepacks": "resource pack",
+    "stats.shaders": "shader", "stats.updates": "update",
+};
+function pl(n, key) {
+    n = Math.abs(Number(n) || 0);
+    if (LANG === "ru" && PL_RU[key]) {
+        const forms = PL_RU[key];
+        const d10 = n % 10, d100 = n % 100;
+        if (d10 === 1 && d100 !== 11) return forms[0];
+        if (d10 >= 2 && d10 <= 4 && (d100 < 12 || d100 > 14)) return forms[1];
+        return forms[2];
+    }
+    if (LANG !== "ru" && n === 1 && PL_EN_ONE[key]) return PL_EN_ONE[key];
+    return t(key);
 }

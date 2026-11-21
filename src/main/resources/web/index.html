@@ -12,56 +12,14 @@
     <!-- Конфигурация тем с сервера (доступные темы, выключенные, кастомные,
          тема/вариант по умолчанию) — ДО инлайн-скрипта ниже: он использует
          window.MODS_THEMES. Отдаётся модулем динамически (не из web-каталога). -->
+    <!-- theme.js отдаётся модулем динамически: window.MODS_THEMES (доступные
+         темы, выключенные, кастомные, тема/вариант по умолчанию) + boot-скрипт
+         применения темы ДО первой отрисовки (localStorage/?theme=/&mode= ->
+         data-theme + data-mode на <html>, без вспышки дефолтной темы).
+         Boot живёт в theme.js, а не инлайном: CSP сервера — script-src 'self',
+         инлайн-скрипты блокируются. При локальном открытии файла theme.js
+         отсутствует — работает запасной glass/dark из дефолтов CSS. -->
     <script src="theme.js"></script>
-    <script>
-        /* Тема оформления до первой отрисовки: localStorage/?theme=/&mode= ->
-           data-theme + data-mode на <html> (иначе была бы вспышка дефолтной
-           темой при загрузке). Конфигурацию тем (window.MODS_THEMES) сервер
-           отдал в theme.js; при локальном открытии файла — запасной glass/dark. */
-        (function () {
-            var IDS = ["glass", "comic", "simple", "neon", "pixel", "terminal"];
-            var M = window.MODS_THEMES || {};
-            var dis = M.disabled || [];
-            var customs = M.custom || [];
-            function available(t) {
-                if (!t) return false;
-                if (IDS.indexOf(t) >= 0) return dis.indexOf(t) < 0;
-                for (var i = 0; i < customs.length; i++) {
-                    if (customs[i] && ("c-" + customs[i].id) === t) return true;
-                }
-                return false;
-            }
-            var def = available(M.defaultTheme) ? M.defaultTheme : "glass";
-            var defMode = M.defaultMode === "light" ? "light" : "dark";
-            var t = null, m = null;
-            try {
-                var q = new URLSearchParams(location.search);
-                t = q.get("theme");
-                m = q.get("mode");
-                var saved = localStorage.getItem("mods_theme");
-                var savedMode = localStorage.getItem("mods_mode");
-                if (available(t)) {
-                    // URL-параметры сильнее сохранённого (демо-ссылки ?theme=)
-                    if (m !== "light" && m !== "dark") m = (savedMode === "light" || savedMode === "dark") ? savedMode : defMode;
-                } else {
-                    t = available(saved) ? saved : def;
-                    m = (savedMode === "light" || savedMode === "dark") ? savedMode : defMode;
-                }
-            } catch (e) {
-                t = def;
-                m = defMode;
-            }
-            document.documentElement.setAttribute("data-theme", t);
-            document.documentElement.setAttribute("data-mode", m);
-            var METAS = { glass: ["#E9F0F9", "#0F172A"], comic: ["#FBEFD3", "#211A10"],
-                simple: ["#F5F6F8", "#101318"], neon: ["#F2FDFF", "#05070E"],
-                pixel: ["#E7E9DC", "#23252B"], terminal: ["#F3F7EE", "#020A04"] };
-            var meta = document.querySelector('meta[name="theme-color"]');
-            if (meta && METAS[t]) meta.setAttribute("content", m === "light" ? METAS[t][0] : METAS[t][1]);
-            var scheme = document.querySelector('meta[name="color-scheme"]');
-            if (scheme) scheme.setAttribute("content", m);
-        })();
-    </script>
 </head>
 <body>
 
@@ -123,6 +81,9 @@
 </div>
 
 <div id="app">
+
+    <!-- 1.1.4: полоса сетевой активности — видна при любом запросе к API -->
+    <div id="net-bar" aria-hidden="true"></div>
 
     <!-- ================= ВХОД ================= -->
     <div id="view-login" class="view login-view hidden">

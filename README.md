@@ -68,6 +68,23 @@ with downloads and updates from **Modrinth** and **CurseForge**:
 - the **"Update hashes"** button — runs the console command
   `config profileprovider sync`: a full "to be sure" sync — HashedDir of ALL
   updates folders + re-reading the profile list from disk;
+- **every wait is visible (1.1.4)**: a thin network activity bar at the top
+  edge shows any in-flight API request; skeleton placeholders while a profile
+  or a search page loads; spinner + disabled state on every action button
+  (add/remove/update/scan/rehash/unban/backup/…); the update progress window
+  got a live elapsed timer (mm:ss); toasts are closable and linger longer
+  for errors; admin tables show a "Loading…" row instead of looking empty;
+- **inline confirmations (1.1.4)**: update/remove/bulk actions ask in a
+  styled dialog (Esc or clicking the backdrop = "Cancel") instead of the
+  browser's native `confirm()` — same look on every platform, focus-trapped;
+- **polish (1.1.4)**: cards cascade in with a small stagger after load, the
+  active tab gets an animated underline, counters use tabular numerals,
+  single-page search hides the pager; fixed: theme flash + CSP console error
+  on every page load (the pre-paint theme script now lives in the CSP-clean
+  dynamic theme.js), unreadable "update available" badge in the comic/pixel
+  dark themes, language switch no longer stops translating buttons that were
+  busy at least once, and a crash of the backups poller when a backup job
+  finished.
 - **hybrid authorization**: local accounts from the config + launcher accounts
   (admin detection via launcher permissions or your own SQL query, e.g. an
   `isAdmin` column);
@@ -88,6 +105,9 @@ from updateOptional — including non-standard profile.json forms
 (`optionalMods[].list`), profile reload, file renames, import of existing
 jars, hash recalculation, content kinds and the suggestion system, themes
 with light/dark variants and custom theme management, console log levels;
+1.1.4 additions — styled confirmations, a real update job with the progress
+window and elapsed timer, folder scan, `config profileprovider sync` rehash,
+backups tab, RU/EN switch (clean browser console under the server CSP);
 automated checks: 430 smoke, 27+ live API/browser checks — all green).
 
 ---
@@ -251,7 +271,8 @@ alive without replacing the jar.
    button). **"Update all"** updates ONLY what the check found (plus mods
    whose file is missing) — it never re-downloads already-actual mods.
    While an update runs, both buttons just open the progress window.
-7. **Progress window** shows per-mod status and bytes, and has a **"Stop"**
+7. **Progress window** shows per-mod status and bytes, a live elapsed timer
+   (mm:ss — you can tell a long download from a hang), and has a **"Stop"**
    button: downloads already started are finished, queued ones are cancelled.
    If you reload or close the page mid-update, the window reopens by itself
    (the running job survives on the server).

@@ -998,7 +998,9 @@ select.input option { background: var(--card-solid); color: var(--text); }
     -webkit-backdrop-filter: blur(9px);
     backdrop-filter: blur(9px);
     display: flex;
-    align-items: flex-start;
+    /* 1.1.4: модалка по центру экрана (раньше прижималась к верху с пустотой
+       снизу); safe — если модалка выше окна, выравнивание откатывается к началу */
+    align-items: safe center;
     justify-content: center;
     padding: 64px 16px 16px;
     z-index: 90;
@@ -1203,7 +1205,7 @@ select.input option { background: var(--card-solid); color: var(--text); }
     .search-toolbar .btn, .suggest-toolbar .btn { flex: 1 1 auto; justify-content: center; }
     .section-title { flex-wrap: wrap; }
     .toast-container { left: 12px; right: 12px; max-width: none; }
-    .modal-backdrop { padding: 40px 10px 10px; }
+    .modal-backdrop { padding: 20px 10px; }
     /* чипы с длинным содержимым (название профиля в pack-meta, версии):
        раньше white-space: nowrap резал их краем экрана (overflow-x: clip
        у body прячет «уехавшее» целиком) — теперь текст переносится */
@@ -1222,6 +1224,30 @@ select.input option { background: var(--card-solid); color: var(--text); }
        Сами данные не теряются: профиль виден в карточке проекта. */
     #table-suggest th:nth-child(4), #table-suggest td:nth-child(4),
     #table-suggest th:nth-child(5), #table-suggest td:nth-child(5) { display: none; }
+    /* 1.1.4: таблица бекапов — «Размер» и «Содержимое» прячем, дата не рвётся
+       посреди числа; иначе на 390px дата ломалась на 4 строки, а бейдж
+       «заморожен» — по буквам */
+    #table-backups th:nth-child(3), #table-backups td:nth-child(3),
+    #table-backups th:nth-child(4), #table-backups td:nth-child(4) { display: none; }
+    #table-backups td:nth-child(2) { white-space: nowrap; }
+    /* 1.1.4: кнопки действий — компактная сетка 3 в ряд, а не столбиком
+       (в узкой ячейке flex-wrap собирал их вертикально). fixed-раскладка
+       даёт колонкам точные ширины: имя — остаток, дата и действия — фикс */
+    #table-backups { table-layout: fixed; }
+    #table-backups .bk-time { display: none; }
+    #table-backups th:nth-child(2), #table-backups td:nth-child(2) { width: 92px; }
+    #table-backups th:last-child, #table-backups td:last-child { width: 118px; }
+    #table-backups .row-actions { justify-content: flex-start; }
+    #table-backups .row-actions .btn { padding: 5px 8px; }
+    /* строка с textarea (домены сайта): на телефоне подпись сверху,
+       поле на всю ширину — иначе текстария сжималась до ~100px */
+    .set-row:has(> textarea), .set-row:has(> input.input) {
+        flex-direction: column;
+        align-items: stretch;
+        gap: 8px;
+    }
+    /* стрелки приоритета источников: тап-таргет побольше */
+    .prio-controls .btn { min-width: 38px; min-height: 38px; justify-content: center; }
 }
 
 /* совсем узкие экраны (<430px): убираем второстепенное */
@@ -1230,10 +1256,37 @@ select.input option { background: var(--card-solid); color: var(--text); }
     .version-chip { display: none; }
     .topbar-title { max-width: 60vw; }
     .login-card { padding: 28px 20px 24px; }
-    /* Подписи вкладок рядом с иконками сжимались до «Мо…» (по ~37px текста
-       на вкладку) — на узких экранах иконку убираем, остаётся полный текст */
-    .navtab { padding: 9px 4px; font-size: 12.5px; gap: 0; }
+    /* 1.1.4: табы с полными подписями + горизонтальная прокрутка — раньше
+       «Предложения»/«Настройки» резались до «Предл…»/«Настр…» (по ~74px
+       на таб при пяти вкладках). Иконки убраны, таб — своя ширина;
+       активный таб доводится до видимости (switchMainTab) */
+    .mainnav {
+        overflow-x: auto;
+        scrollbar-width: none;
+        -webkit-overflow-scrolling: touch;
+    }
+    .mainnav::-webkit-scrollbar { display: none; }
+    /* намёк, что табы продолжаются: затухание у краёв (классы вешает
+       updateNavHint) — справа пока не доскроллено, слева если уже уехали */
+    .mainnav.can-scroll {
+        -webkit-mask-image: linear-gradient(to right, #000 88%, transparent);
+        mask-image: linear-gradient(to right, #000 88%, transparent);
+    }
+    .mainnav.scrolled {
+        -webkit-mask-image: linear-gradient(to left, #000 88%, transparent);
+        mask-image: linear-gradient(to left, #000 88%, transparent);
+    }
+    .mainnav.can-scroll.scrolled {
+        -webkit-mask-image: linear-gradient(to right, transparent, #000 10% 90%, transparent);
+        mask-image: linear-gradient(to right, transparent, #000 10% 90%, transparent);
+    }
+    .navtab { flex: 0 0 auto; padding: 9px 13px; font-size: 12.5px; gap: 0; }
     .navtab .icon { display: none; }
+    .navtab span { overflow: visible; text-overflow: clip; white-space: nowrap; }
+    /* логин в бейдже обрезался до «a…» — на узком экране остаётся
+       только роль (полный логин — в меню «Выйти»/title) */
+    .user-badge { max-width: none; }
+    .user-badge > span:not(.role-chip) { display: none; }
 }
 
 /* ============================ reduced motion ============================ */
@@ -1576,17 +1629,21 @@ input.toggle:focus-visible { outline: 2px solid var(--accent-bright); outline-of
     max-height: 240px; overflow-y: auto; padding-right: 4px;
 }
 .scan-row {
-    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
-    padding: 4px 6px; border-radius: 8px;
+    display: flex; align-items: center; gap: 6px 10px; flex-wrap: wrap;
+    padding: 5px 6px; border-radius: 8px;
 }
 .scan-row:hover { background: var(--hover-tint); }
+/* 1.1.4: единая раскладка строк — слева бейдж и имя, справа кнопки,
+   мета-строка всегда на своей линии под ними (не «плавает» между строк) */
+.scan-row .badge { order: 0; }
 .scan-name {
+    order: 1;
     font-family: var(--font-mono); font-size: 12.5px;
-    word-break: break-all; flex: 1 1 180px;
+    word-break: break-all; flex: 1 1 120px; min-width: 0;
 }
-.scan-meta { color: var(--muted, #9aa3b2); font-size: 12px; word-break: break-all; }
+.scan-actions { order: 2; display: flex; gap: 6px; flex-wrap: wrap; margin-left: auto; }
+.scan-meta { order: 3; flex-basis: 100%; color: var(--muted, #9aa3b2); font-size: 12px; word-break: break-all; }
 .scan-meta .icon { width: 12px; height: 12px; vertical-align: -2px; }
-.scan-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-left: auto; }
 .scan-empty {
     display: flex; align-items: center; gap: 8px;
     padding: 14px 8px; color: var(--ok, #7bd88f); font-size: 14px;
@@ -1862,6 +1919,14 @@ input.toggle:focus-visible { outline: 2px solid var(--accent-bright); outline-of
 }
 [data-theme="comic"] :is(.login-logo img, .topbar-logo) { filter: none; }
 [data-theme="comic"] .badge { border-color: var(--ink); background: var(--badge-bg); }
+/* «есть обновление»: жёлтый градиент с тёмным текстом НЕ перекрывается общим
+   правилом .badge выше (у него выше специфичность — получался чёрный на
+   чёрном «блоб» в тёмном варианте); перекрытые фоны остальных бейджей — НЕТ */
+[data-theme="comic"] .badge.update {
+    background: linear-gradient(135deg, #FDE047, #F59E0B);
+    color: #17130B;
+    border-color: var(--ink);
+}
 [data-theme="comic"] :is(.mod-card:hover, .profile-chip:hover) { box-shadow: 6px 6px 0 var(--ink); }
 
 /* комикс, тёмный вариант: «ночной выпуск» — тёмная бумага и кремовые чернила */
@@ -2316,6 +2381,12 @@ input.toggle:focus-visible { outline: 2px solid var(--accent-bright); outline-of
 }
 [data-theme="pixel"] :is(.login-logo img, .topbar-logo) { filter: none; }
 [data-theme="pixel"] .badge { background: var(--badge-bg); border-color: var(--ink); }
+/* тот же фикс, что и в comic: градиентный бейдж «есть обновление» */
+[data-theme="pixel"] .badge.update {
+    background: linear-gradient(135deg, #FDE047, #F59E0B);
+    color: #17130B;
+    border-color: var(--ink);
+}
 [data-theme="pixel"] .subnavtab.active {
     color: #7FB8E8;
     border-color: rgba(74, 155, 214, 0.55);
@@ -2960,3 +3031,241 @@ input.toggle:focus-visible { outline: 2px solid var(--accent-bright); outline-of
 .upd-row.st-error .icon { color: var(--danger, #F87171); }
 .upd-row.st-error .upd-meta { color: var(--danger, #F87171); }
 .upd-row.st-skipped .icon { color: var(--text-muted); }
+
+/* ============================================================================
+   1.1.4 — QoL-индикация + микроанимации
+   Принципы: видимость состояния системы (Нильсен #1), целевые микро-
+   взаимодействия (Emil Kowalski), всё через токены тем — работает во всех
+   шести темах; всё гасится при prefers-reduced-motion.
+   ========================================================================== */
+
+/* --- Полоса сетевой активности: ЛЮБОЙ запрос к API виден у верхнего края --- */
+#net-bar {
+    position: fixed;
+    top: 0; left: 0; right: 0;
+    height: 2.5px;
+    z-index: 90;
+    pointer-events: none;
+    background: linear-gradient(90deg, transparent 0%, var(--accent-bright) 45%, var(--accent) 60%, transparent 100%);
+    background-size: 50% 100%;
+    background-repeat: no-repeat;
+    opacity: 0;
+    transition: opacity .18s ease;
+}
+#net-bar.on {
+    opacity: 1;
+    animation: net-slide 1.05s cubic-bezier(.45, 0, .4, 1) infinite;
+}
+@keyframes net-slide {
+    0%   { background-position: -55% 0; }
+    100% { background-position: 155% 0; }
+}
+
+/* --- Скелетоны: карточки-заглушки и мерцающие чипы при загрузке ---
+   (яркость 0.19 — заглушки читаемо светлее фона карточки, но тише контента) */
+.mod-card.skeleton, .skeleton-chip {
+    pointer-events: none;
+    user-select: none;
+}
+.mod-card.skeleton {
+    display: flex;
+    gap: 13px;
+    padding: 15px;
+    min-height: 116px;
+    background: var(--card-tint);
+    border-color: var(--border);
+    box-shadow: none;
+}
+.sk-icon {
+    width: 46px; height: 46px;
+    border-radius: var(--radius);
+    flex-shrink: 0;
+    background: var(--sk, rgba(148, 163, 184, 0.19));
+    animation: sk-pulse 1.35s ease-in-out infinite;
+}
+.sk-body {
+    display: flex;
+    flex-direction: column;
+    gap: 9px;
+    flex: 1;
+    padding-top: 3px;
+}
+.sk-line {
+    height: 11px;
+    border-radius: 6px;
+    background: var(--sk, rgba(148, 163, 184, 0.19));
+    animation: sk-pulse 1.35s ease-in-out infinite;
+}
+.sk-line.w40 { width: 40%; animation-delay: .12s; }
+.sk-line.w60 { width: 60%; animation-delay: .06s; }
+.sk-line.w90 { width: 90%; }
+.skeleton-chip {
+    display: inline-block;
+    height: 22px;
+    min-width: 120px;
+    border-radius: 999px;
+    background: var(--sk, rgba(148, 163, 184, 0.19));
+    animation: sk-pulse 1.35s ease-in-out infinite;
+}
+.skeleton-chip.short { min-width: 72px; animation-delay: .1s; }
+@keyframes sk-pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: .45; }
+}
+
+/* --- Строка «Загрузка…» для таблиц --- */
+.loading-row td {
+    text-align: center !important;
+    padding: 26px 12px !important;
+}
+.loading-row .spin { margin-right: 9px; vertical-align: -2px; }
+
+/* --- Чип профиля в состоянии загрузки (сменён профиль — данные грузятся) --- */
+.profile-chip.pending { position: relative; }
+.profile-chip.pending .title::after {
+    content: "";
+    display: inline-block;
+    width: 9px; height: 9px;
+    margin-left: 8px;
+    border: 2px solid var(--border-strong);
+    border-top-color: var(--accent-bright);
+    border-radius: 50%;
+    animation: spin .8s linear infinite;
+    vertical-align: 0;
+}
+
+/* --- Каскадное появление карточек (только при загрузке состава/поиска) --- */
+.mods-grid.anim-in .mod-card:not(.skeleton),
+.results-grid .mod-card:not(.skeleton) {
+    animation: card-in .3s cubic-bezier(.2, .7, .3, 1) both;
+    animation-delay: calc(var(--i, 0) * 24ms);
+}
+@keyframes card-in {
+    from { opacity: 0; transform: translateY(9px) scale(.99); }
+    to   { opacity: 1; transform: none; }
+}
+
+/* --- Приглушение старых результатов при перелистывании страницы поиска --- */
+.results-grid.updating { opacity: .5; transition: opacity .15s ease; }
+.results-grid:not(.updating) { transition: opacity .2s ease; }
+
+/* --- Активная вкладка: подсветка-«карандаш» снизу --- */
+.navtab { position: relative; }
+.navtab::after {
+    content: "";
+    position: absolute;
+    left: 14px; right: 14px; bottom: 4px;
+    height: 2.5px;
+    border-radius: 2px;
+    background: var(--accent-grad, linear-gradient(90deg, var(--accent-bright), var(--accent)));
+    transform: scaleX(0);
+    transform-origin: left center;
+    transition: transform .22s cubic-bezier(.2, .7, .3, 1);
+}
+.navtab:hover::after { transform: scaleX(.4); }
+.navtab.active::after { transform: scaleX(1); }
+
+/* --- Тосты: пружинный выезд, аккуратный уход, кнопка закрытия --- */
+.toast {
+    position: relative;
+    padding-right: 34px;
+    animation: toast-pop .3s cubic-bezier(.18, .89, .32, 1.28) both;
+}
+.toast.out { animation: toast-out .18s ease both; }
+.toast-close {
+    position: absolute;
+    top: 5px; right: 5px;
+    background: transparent;
+    border: none;
+    color: var(--text-muted);
+    padding: 4px;
+    border-radius: 6px;
+    cursor: pointer;
+    display: inline-flex;
+    transition: color var(--t-fast), background var(--t-fast);
+}
+.toast-close:hover { color: var(--text); background: var(--hover-tint); }
+.toast-close .icon { width: 12px; height: 12px; }
+@keyframes toast-pop {
+    from { opacity: 0; transform: translateY(14px) scale(.96); }
+    to   { opacity: 1; transform: none; }
+}
+@keyframes toast-out {
+    from { opacity: 1; transform: none; }
+    to   { opacity: 0; transform: translateY(8px) scale(.97); }
+}
+
+/* --- Галочка «Опциональный» в процессе сохранения --- */
+.mod-check.saving span::after {
+    content: "";
+    display: inline-block;
+    width: 9px; height: 9px;
+    margin-left: 7px;
+    border: 2px solid var(--border-strong);
+    border-top-color: var(--accent-bright);
+    border-radius: 50%;
+    animation: spin .8s linear infinite;
+}
+.mod-check input:disabled { cursor: progress; }
+
+/* --- Строка активной задачи бекапа: вращающаяся иконка --- */
+#backup-job .icon { animation: spin 1.1s linear infinite; color: var(--accent-bright); }
+
+/* --- Счётчик времени в окне обновления: моноширинный, не «прыгает» --- */
+.upd-elapsed {
+    margin-left: 10px;
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    letter-spacing: .03em;
+    color: var(--text-muted);
+}
+.upd-count, .search-page, .shown-counter,
+.stat-chip b, .cnt, .hit-stat, .pack-stats, #backups-total {
+    font-variant-numeric: tabular-nums;
+}
+
+/* --- Селекты/кнопки в состоянии «применяется» --- */
+.select:disabled, .input:disabled { cursor: progress; opacity: .75; }
+.btn[aria-busy="true"] { cursor: progress; }
+.icon-btn[aria-busy="true"] { cursor: progress; opacity: .8; }
+.icon-btn .spin { width: 12px; height: 12px; }
+
+/* --- Подтверждение (confirmModal): текст крупнее обычного muted --- */
+.confirm-text {
+    margin: 4px 0 6px;
+    font-size: 14.5px;
+    line-height: 1.55;
+    color: var(--text);
+    overflow-wrap: anywhere;
+}
+
+/* --- Карточки: чуть живее отклик на наведение (для всех тем через токены) --- */
+.mod-card { transition: transform var(--t), border-color var(--t), box-shadow var(--t), background var(--t); }
+.mod-card:hover { border-color: var(--border-strong); }
+@media (hover: hover) {
+    .mod-card:hover { transform: translateY(-2px); }
+    .mod-card:active { transform: translateY(0); }
+}
+
+/* --- reduced motion: каскады и мерцания выключены, спиннеры остаются --- */
+@media (prefers-reduced-motion: reduce) {
+    #net-bar.on { animation: none; opacity: 1; }
+    .mods-grid.anim-in .mod-card:not(.skeleton),
+    .results-grid .mod-card:not(.skeleton),
+    .mod-card, .toast, .toast.out { animation: none !important; }
+    .sk-icon, .sk-line, .skeleton-chip { animation: none !important; opacity: .55; }
+    .navtab::after { transition: none; }
+    .results-grid.updating { opacity: .5; }
+}
+
+/* --- 1.1.4: тач-таргеты на телефоне и планшете (блок в конце файла: базовые
+   .chip определены выше по каскаду, ранний медиа-блок они перебивали).
+   До 900px — это зона тач-устройств: чипы/иконки-кнопки/селектор загрузчика
+   были 26-29px, по Apple HIG минимум ~32-44px --- */
+@media (max-width: 900px) {
+    .chip { padding: 9px 13px; }
+    .icon-btn { padding: 9px; }
+    .loader-chip .select.slim { padding: 9px 26px 9px 9px; }
+    /* строка темы во встроенных: весь ряд — одна тап-зона (label) */
+    .theme-admin-row { cursor: pointer; }
+}

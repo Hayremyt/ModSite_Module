@@ -95,15 +95,73 @@ function icon(name, cls) {
     return '<svg class="icon' + (cls ? " " + cls : "") + '" aria-hidden="true"><use href="#i-' + name + '"/></svg>';
 }
 
-/** Кнопка в состоянии загрузки: спиннер + текст, затем иконка + текст. */
+/** Кнопка в состоянии загрузки: спиннер + текст, затем иконка + текст.
+ *  В обоих состояниях у подписи остаётся data-i18n — иначе после первого
+ *  действия кнопка переставала переводиться при смене языка (1.1.4). */
 function setBtnLoading(btn, i18nKey, iconName, loading) {
     if (!btn) return;
     if (loading) {
-        btn.innerHTML = '<span class="spin" aria-hidden="true"></span><span>' + t(i18nKey) + "</span>";
+        btn.innerHTML = '<span class="spin" aria-hidden="true"></span><span data-i18n="'
+            + esc(i18nKey) + '">' + t(i18nKey) + "</span>";
         btn.disabled = true;
+        btn.setAttribute("aria-busy", "true");
     } else {
-        btn.innerHTML = icon(iconName) + "<span>" + t(i18nKey) + "</span>";
+        btn.innerHTML = icon(iconName) + '<span data-i18n="' + esc(i18nKey) + '">'
+            + t(i18nKey) + "</span>";
         btn.disabled = false;
+        btn.removeAttribute("aria-busy");
+    }
+}
+
+/** 1.1.4: универсальная занятость произвольной кнопки (в т.ч. динамической):
+ *  исходная разметка сохраняется и возвращается после. Текст можно заменить
+ *  на «Выполняется…» (loadingKey) или оставить прежний (только спиннер). */
+function btnBusy(btn, on, loadingKey) {
+    if (!btn) return;
+    if (on) {
+        if (!btn.dataset.busyHtml) btn.dataset.busyHtml = btn.innerHTML;
+        const label = loadingKey ? t(loadingKey) : (btn.querySelector(":scope > span:last-child") || {}).textContent || "";
+        btn.innerHTML = '<span class="spin" aria-hidden="true"></span><span>' + esc(label) + "</span>";
+        btn.disabled = true;
+        btn.setAttribute("aria-busy", "true");
+    } else {
+        if (btn.dataset.busyHtml) btn.innerHTML = btn.dataset.busyHtml;
+        delete btn.dataset.busyHtml;
+        btn.disabled = false;
+        btn.removeAttribute("aria-busy");
+    }
+}
+
+/** 1.1.4: перемотать окно так, чтобы элемент оказался под липким топбаром.
+ *  Вызывается после смены страницы поиска/аудита: результаты перерисованы —
+ *  пользователь сразу видит их начало, а не остаётся внизу старой прокрутки.
+ *  Уважает prefers-reduced-motion (без плавной анимации). */
+function scrollToAnchor(el) {
+    if (!el) return;
+    const topbar = document.querySelector(".topbar");
+    const offset = (topbar ? topbar.offsetHeight : 0) + 8;
+    const y = el.getBoundingClientRect().top + window.scrollY - offset;
+    const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    window.scrollTo({ top: Math.max(0, y), behavior: reduceMotion ? "auto" : "smooth" });
+}
+
+/** 1.1.4: тонкая полоса сетевой активности у верхнего края экрана — виден
+ *  ЛЮБОЙ идущий запрос (как в YouTube/GitHub): сразу понятно, что процесс
+ *  живой, а не «завис». Прячется с задержкой, чтобы не мигать на быстрых
+ *  ответах. */
+let NET_PENDING = 0, NET_TIMER = null;
+function netActivity(on) {
+    const bar = $("net-bar");
+    if (!bar) return;
+    if (on) {
+        NET_PENDING++;
+        bar.classList.add("on");
+    } else if (--NET_PENDING <= 0) {
+        NET_PENDING = 0;
+        clearTimeout(NET_TIMER);
+        NET_TIMER = setTimeout(() => {
+            if (NET_PENDING === 0) bar.classList.remove("on");
+        }, 260);
     }
 }
 
@@ -115,8 +173,23 @@ function toast(message, kind) {
     const span = document.createElement("span");
     span.textContent = message;
     el.appendChild(span);
+    // 1.1.4: тост можно закрыть и вручную; ошибки/предупреждения живут дольше
+    const close = document.createElement("button");
+    close.type = "button";
+    close.className = "toast-close";
+    close.setAttribute("aria-label", t("common.close"));
+    close.innerHTML = icon("x");
+    close.addEventListener("click", () => {
+        el.classList.add("out");
+        setTimeout(() => el.remove(), 180);
+    });
+    el.appendChild(close);
     $("toast-container").appendChild(el);
-    setTimeout(() => el.remove(), 5200);
+    const ttl = kind === "error" || kind === "warn" ? 7400 : 4800;
+    setTimeout(() => {
+        el.classList.add("out");
+        setTimeout(() => el.remove(), 180);
+    }, ttl);
 }
 
 /** Показать предупреждения источников (сеть/403/троттлинг) из ответа
@@ -148,10 +221,12 @@ async function api(path, options) {
     if (options && options.body) {
         opts.body = JSON.stringify(options.body);
     }
+    netActivity(true);
     let response;
     try {
         response = await fetch(API_BASE + path.replace(/^\//, ""), opts);
     } catch (e) {
+        netActivity(false);
         return { ok: false, error: { code: "offline", message: t("login.error.offline") } };
     }
     let payload = null;
@@ -160,6 +235,7 @@ async function api(path, options) {
     } catch (e) {
         payload = { success: false, error: { code: "bad_response", message: "HTTP " + response.status } };
     }
+    netActivity(false);
     // 401 на самом запросе входа — это ожидаемый ответ (need_totp / неверный пароль):
     // обрабатывает doLogin, поля нельзя очищать. Сброс на экран входа — только для
     // остальных вызовов (истёкшая сессия).
@@ -296,6 +372,14 @@ async function boot() {
     $("tab-settings").classList.toggle("hidden", !isAdmin);
     $("tab-backups").classList.toggle("hidden", !isAdmin);
     $("tab-suggest").classList.toggle("hidden", !isAdmin);
+    // 1.1.4: индикатор «табы продолжаются» на телефоне — первичный расчёт
+    // и обновление при прокрутке навигации/изменении окна
+    const navEl = document.querySelector(".mainnav");
+    if (navEl) {
+        navEl.addEventListener("scroll", updateNavHint, { passive: true });
+        window.addEventListener("resize", updateNavHint);
+    }
+    updateNavHint();
     // Админские кнопки: наблюдателю скрываем (display:none), админу — показываем.
     // Кнопки НЕ удаляются из DOM: смена сессии наблюдатель→админ в той же
     // вкладке восстанавливает их без перезагрузки страницы.
@@ -374,8 +458,39 @@ async function selectProfile(dir) {
     S.backupsFoldersDirty = false; // выбор папок бекапа — заново на каждый профиль
     const searchInput = $("mod-search");
     if (searchInput) searchInput.value = "";
+    renderProfileSkeleton(); // 1.1.4: пока идёт запрос — скелетоны, а не прошлый профиль
     await loadPack();
     renderProfiles();
+}
+
+/** 1.1.4: скелетон-заглушки на время загрузки состава: чип профиля — с
+ *  спиннером, сетка — мерцающие карточки-заглушки. Сразу видно, что данные
+ *  грузятся, а не «зависло» / «уже всё» (принцип видимости состояния). */
+function renderProfileSkeleton() {
+    const bar = $("profiles-bar");
+    if (bar) {
+        bar.querySelectorAll(".profile-chip").forEach(chip => {
+            chip.classList.toggle("pending", chip.classList.contains("active"));
+        });
+    }
+    const grid = $("mods-grid");
+    const empty = $("mods-empty");
+    if (grid && !grid.classList.contains("hidden")) {
+        grid.innerHTML = skeletonCards(8);
+        grid.setAttribute("aria-busy", "true");
+    }
+    if (empty) empty.classList.add("hidden");
+    const meta = $("pack-meta");
+    if (meta) meta.innerHTML = '<span class="meta-chip skeleton-chip"></span><span class="meta-chip skeleton-chip short"></span><span class="meta-chip skeleton-chip short"></span>';
+    const stats = $("pack-stats");
+    if (stats) stats.innerHTML = "";
+}
+
+/** Карточки-скелетоны (мерцающие заглушки) для сеток. */
+function skeletonCards(n) {
+    let out = "";
+    for (let i = 0; i < n; i++) out += '<div class="mod-card skeleton" aria-hidden="true"><div class="sk-icon"></div><div class="sk-body"><div class="sk-line w60"></div><div class="sk-line w90"></div><div class="sk-line w40"></div></div></div>';
+    return out;
 }
 
 function renderProfiles() {
@@ -390,9 +505,9 @@ function renderProfiles() {
         // состав: моды · пакеты · шейдеры (только непустые)
         const parts = [];
         const modsCount = profile.modsKindCount != null ? profile.modsKindCount : profile.modsCount;
-        if (modsCount) parts.push(`<b>${modsCount}</b> ${t("stats.mods")}`);
-        if (profile.resourcepacksCount) parts.push(`<b>${profile.resourcepacksCount}</b> ${t("stats.resourcepacks")}`);
-        if (profile.shadersCount) parts.push(`<b>${profile.shadersCount}</b> ${t("stats.shaders")}`);
+        if (modsCount) parts.push(`<b>${modsCount}</b> ${pl(modsCount, "stats.mods")}`);
+        if (profile.resourcepacksCount) parts.push(`<b>${profile.resourcepacksCount}</b> ${pl(profile.resourcepacksCount, "stats.resourcepacks")}`);
+        if (profile.shadersCount) parts.push(`<b>${profile.shadersCount}</b> ${pl(profile.shadersCount, "stats.shaders")}`);
         if (!parts.length) parts.push(`<b>0</b> ${t("stats.mods")}`);
         el.innerHTML = `<span class="title">${esc(profile.title)}</span>
             <span class="meta">${esc(profile.gameVersion || "?")} · ${esc(profile.loader || "any")} ·
@@ -420,7 +535,9 @@ async function loadPack(retry) {
     }
     S.pack = result.data;
     orphanShowAll = false;
-    renderPack();
+    renderPack(true);
+    const grid = $("mods-grid");
+    if (grid) grid.removeAttribute("aria-busy");
     // Обновление уже идёт (например, страница перезагружена посреди задачи) —
     // сервер прислал снимок задачи: сразу открываем окно статуса
     if (result.data.job && !result.data.job.finished) {
@@ -513,7 +630,7 @@ function updateFilterBar() {
     if (clear) clear.classList.toggle("hidden", !query);
 }
 
-function renderPack() {
+function renderPack(animate) {
     const grid = $("mods-grid");
     const empty = $("mods-empty");
     updateFilterBar();
@@ -562,17 +679,18 @@ function renderPack() {
     const kindCounts = { mod: 0, resourcepack: 0, shader: 0 };
     (S.pack.mods || []).forEach(m => { kindCounts[m.kind || "mod"] = (kindCounts[m.kind || "mod"] || 0) + 1; });
     const updatable = (S.pack.mods || []).filter(m => m.hasUpdate).length;
-    const kindLabel = {
-        mod: t("stats.mods"), resourcepack: t("stats.resourcepacks"), shader: t("stats.shaders"),
+    // 1.1.4: формы согласуются с числом (pl): «1 мод», «2 шейдера» —
+    // раньше любые значения давали «N модов / N шейдеров»
+    const statsChip = (kind) => {
+        const key = kind === "mod" ? "stats.mods" : kind === "resourcepack" ? "stats.resourcepacks" : "stats.shaders";
+        return kindCounts[kind] ? `<span class="stat-chip">${icon(kind === "mod" ? "package" : kind === "resourcepack" ? "image" : "sparkles")}<b>${kindCounts[kind]}</b> ${esc(pl(kindCounts[kind], key))}</span>` : "";
     };
     // Состав показываем чипами по типам (моды · паки · шейдеры): всё, что
     // есть в модпаке, и так входит в состав — отдельные счётчики «всего»
     // и «включено» не несут информации и убраны.
     stats.innerHTML =
-        (kindCounts.mod ? `<span class="stat-chip">${icon("package")}<b>${kindCounts.mod}</b> ${esc(kindLabel.mod)}</span>` : "") +
-        (kindCounts.resourcepack ? `<span class="stat-chip">${icon("image")}<b>${kindCounts.resourcepack}</b> ${esc(kindLabel.resourcepack)}</span>` : "") +
-        (kindCounts.shader ? `<span class="stat-chip">${icon("sparkles")}<b>${kindCounts.shader}</b> ${esc(kindLabel.shader)}</span>` : "") +
-        (updatable ? `<span class="stat-chip warn">${icon("refresh")}<b>${updatable}</b> ${esc(t("stats.updates"))}</span>` : "");
+        statsChip("mod") + statsChip("resourcepack") + statsChip("shader") +
+        (updatable ? `<span class="stat-chip warn">${icon("refresh")}<b>${updatable}</b> ${esc(pl(updatable, "stats.updates"))}</span>` : "");
 
     const byId = {};
     (S.pack.mods || []).forEach(m => byId[m.id] = m);
@@ -597,8 +715,13 @@ function renderPack() {
         grid.appendChild(counter);
     }
     for (const mod of shown) {
-        grid.appendChild(renderModCard(mod, byId, conflictIds, isAdmin));
+        const card = renderModCard(mod, byId, conflictIds, isAdmin);
+        // 1.1.4: каскадное появление карточек после (за)грузки состава —
+        // только при animate (фильтры/галочки не перезапускают анимацию)
+        if (animate) card.style.setProperty("--i", String(Math.min(shown.indexOf(mod), 12)));
+        grid.appendChild(card);
     }
+    grid.classList.toggle("anim-in", !!animate);
     // лишние файлы: импорт в модпак (по хэшам Modrinth/CurseForge) или удаление выбранных
     if (isAdmin && S.pack.orphans && S.pack.orphans.length) {
         const n = S.pack.orphans.length;
@@ -637,9 +760,9 @@ function renderPack() {
         importBtn.addEventListener("click", importOrphans);
         const cleanBtn = document.createElement("button");
         cleanBtn.type = "button";
-        cleanBtn.className = "btn danger small";
+        cleanBtn.className = "btn danger small orphan-clean";
         cleanBtn.textContent = t("mods.clean");
-        cleanBtn.addEventListener("click", cleanOrphans);
+        cleanBtn.addEventListener("click", () => cleanOrphans(cleanBtn));
         tools.appendChild(importBtn);
         tools.appendChild(cleanBtn);
         div.appendChild(tools);
@@ -740,7 +863,7 @@ function renderModCard(mod, byId, conflictIds, isAdmin) {
             skipBtn.className = "btn small " + (postponed ? "ghost" : "warn");
             skipBtn.innerHTML = icon("clock") + "<span>" + esc(postponed ? t("mods.resume") : t("mods.postpone")) + "</span>";
             skipBtn.title = postponed ? t("mods.postponedCleared") : t("mods.postponedSet");
-            skipBtn.addEventListener("click", () => skipUpdate(mod, !postponed));
+            skipBtn.addEventListener("click", () => skipUpdate(mod, !postponed, skipBtn));
             actions.push(skipBtn);
         }
         const setBtn = document.createElement("button");
@@ -755,7 +878,7 @@ function renderModCard(mod, byId, conflictIds, isAdmin) {
         rmBtn.type = "button";
         rmBtn.className = "btn small danger";
         rmBtn.innerHTML = icon("trash") + "<span>" + esc(t("mods.remove")) + "</span>";
-        rmBtn.addEventListener("click", () => removeMod(mod));
+        rmBtn.addEventListener("click", () => removeMod(mod, rmBtn));
         actions.push(rmBtn);
     }
     const actionsDiv = document.createElement("div");
@@ -778,7 +901,7 @@ function renderModCard(mod, byId, conflictIds, isAdmin) {
     // обработчик галочки «Опциональный»
     const optionalBox = card.querySelector("input[data-optional]");
     if (optionalBox) {
-        optionalBox.addEventListener("change", () => toggleModOptional(mod, optionalBox.checked));
+        optionalBox.addEventListener("change", () => toggleModOptional(mod, optionalBox.checked, optionalBox));
     }
     return card;
 }
@@ -789,11 +912,17 @@ function renderModCard(mod, byId, conflictIds, isAdmin) {
  *  Тот же вызов API, что и галочка в «Настройках» записи, — modpack.json
  *  и updateOptional профиля синхронизируются сразу. Включённым мод
  *  бывает всегда: скачан — значит нужен, выключить нельзя. */
-async function toggleModOptional(mod, optional) {
+async function toggleModOptional(mod, optional, box) {
+    // 1.1.4: пока идёт запрос — галочка заблокирована и помечена спиннером
+    const label = box ? box.closest(".mod-check") : null;
+    if (box) { box.disabled = true; }
+    if (label) label.classList.add("saving");
     const result = await api("mods/settings", {
         method: "POST",
         body: { profile: S.currentProfile, id: mod.id, optional: !!optional },
     });
+    if (box) box.disabled = false;
+    if (label) label.classList.remove("saving");
     if (result.ok) {
         const entry = result.data.entry;
         const index = S.pack.mods.findIndex(m => m.id === mod.id);
@@ -834,11 +963,14 @@ async function checkUpdates() {
 }
 
 /** Отложить обновление мода (не ставить последнюю версию) / снять отсрочку. */
-async function skipUpdate(mod, skip) {
+async function skipUpdate(mod, skip, btn) {
+    // 1.1.4: кнопка показывает процесс, пока идёт запрос
+    if (btn) btnBusy(btn, true);
     const result = await api("mods/skip", {
         method: "POST",
         body: { profile: S.currentProfile, id: mod.id, skip: !!skip },
     });
+    if (btn) btnBusy(btn, false);
     if (result.ok) {
         const entry = result.data.entry;
         const index = S.pack.mods.findIndex(m => m.id === mod.id);
@@ -884,7 +1016,7 @@ async function updateMods(ids, busyBtn) {
             toast(t("mods.checked") + " (0)", "success");
             return;
         }
-        if (!confirm(t("mods.updateConfirm", { count: targets.length }))) return;
+        if (!(await confirmModal(t("mods.updateConfirm", { count: targets.length }), { okLabel: "mods.updateAll" }))) return;
         body.ids = targets.map(m => m.id);
     } else {
         body.ids = ids;
@@ -936,7 +1068,8 @@ function openUpdateProgressModal(type) {
     openModal(
         '<h3 class="modal-title" id="upd-title">' + esc(t("upd.title")) + "</h3>"
         + '<div class="upd-phase" id="upd-phase"><span class="spin"></span><span id="upd-phase-text">'
-            + esc(t("upd.preparing")) + "</span></div>"
+            + esc(t("upd.preparing")) + "</span>"
+            + '<span class="upd-elapsed muted small" id="upd-elapsed" title="' + esc(t("upd.elapsed")) + '"></span></div>'
         + '<div class="upd-bar"><div class="upd-bar-fill indeterminate" id="upd-bar"></div></div>'
         + '<div class="upd-count muted small" id="upd-count"></div>'
         + '<div class="upd-list" id="upd-progress-list" role="log" aria-live="polite"></div>',
@@ -1032,6 +1165,16 @@ function updRow(m) {
     return row;
 }
 
+/** 1.1.4: «сколько уже идёт» — мм:сс с момента запуска задачи. Тикающий
+ *  таймер в окне статуса показывает, что процесс живой, на длинных фазах
+ *  (проверка/скачивание/пересчёт хэшей). */
+function updElapsedText() {
+    if (!S.updateJob || !S.updateJob.openedAt) return "";
+    const sec = Math.max(0, Math.floor((Date.now() - S.updateJob.openedAt) / 1000));
+    const mm = Math.floor(sec / 60), ss = sec % 60;
+    return mm + ":" + String(ss).padStart(2, "0");
+}
+
 function renderUpdateProgress(job) {
     // модалка могла быть закрыта/заменена — тогда только ждём финиша
     const phaseText = $("upd-phase-text");
@@ -1040,6 +1183,9 @@ function renderUpdateProgress(job) {
     const titleEl = $("upd-title");
     if (titleEl) titleEl.textContent = t("upd.title");
     phaseText.textContent = updPhaseText(job);
+    // 1.1.4: тикающий счётчик времени рядом с фазой (0:42)
+    const elapsedEl = $("upd-elapsed");
+    if (elapsedEl) elapsedEl.textContent = job.finished ? "" : updElapsedText();
     // на финише спиннер фазы больше не крутится
     const spin = $("upd-phase").querySelector(".spin");
     if (spin) spin.style.display = job.finished ? "none" : "";
@@ -1104,18 +1250,20 @@ async function rehash() {
     }
 }
 
-async function removeMod(mod) {
-    if (!confirm(t("mods.removeConfirm", { name: mod.name || mod.id }))) return;
+async function removeMod(mod, btn) {
+    if (!(await confirmModal(t("mods.removeConfirm", { name: mod.name || mod.id }), { danger: true, okLabel: "mods.remove" }))) return;
+    if (btn) btnBusy(btn, true); // 1.1.4: пока удаляем — кнопка в состоянии загрузки
     const result = await api("mods/remove", { method: "POST", body: { profile: S.currentProfile, ids: [mod.id] } });
     if (result.ok) {
         await loadProfiles();
         await loadPack();
     } else {
+        if (btn) btnBusy(btn, false);
         toast(result.error ? result.error.message : t("common.error"), "error");
     }
 }
 
-async function cleanOrphans() {
+async function cleanOrphans(btn) {
     const card = document.querySelector(".orphan-card");
     const files = card
         ? Array.from(card.querySelectorAll(".orphan-item input:checked"))
@@ -1125,12 +1273,14 @@ async function cleanOrphans() {
         toast(t("mods.selectOne"), "warn");
         return;
     }
+    if (btn) btnBusy(btn, true); // 1.1.4: индикация процесса на кнопке
     const result = await api("mods/clean", { method: "POST", body: { profile: S.currentProfile, files } });
     if (result.ok) {
         toast(t("mods.cleaned") + ": " + (result.data.removed || 0), "success");
         orphanShowAll = false;
         await loadPack();
     } else {
+        if (btn) btnBusy(btn, false);
         toast(result.error ? result.error.message : t("common.error"), "error");
     }
 }
@@ -1146,14 +1296,11 @@ async function importOrphans() {
         return;
     }
     const btn = card.querySelector(".orphan-import");
-    const original = btn.textContent;
-    btn.disabled = true;
-    btn.textContent = t("mods.importing");
+    btnBusy(btn, true, "mods.importing");
     const result = await api("mods/import", { method: "POST", body: { profile: S.currentProfile, files } });
     if (!result.ok) {
+        btnBusy(btn, false);
         toast(result.error ? result.error.message : t("common.error"), "error");
-        btn.disabled = false;
-        btn.textContent = original;
         return;
     }
     const d = result.data;
@@ -1287,39 +1434,40 @@ function renderScanModal() {
     const backdrop = $("modal-backdrop");
     if (!backdrop) return;
     backdrop.querySelectorAll("[data-scan-restore]").forEach(b =>
-        b.addEventListener("click", () => scanRestore([b.dataset.scanRestore])));
+        b.addEventListener("click", () => scanRestore([b.dataset.scanRestore], b)));
     backdrop.querySelectorAll("[data-scan-remove]").forEach(b =>
-        b.addEventListener("click", () => scanRemoveEntries([b.dataset.scanRemove])));
+        b.addEventListener("click", () => scanRemoveEntries([b.dataset.scanRemove], b)));
     backdrop.querySelectorAll("[data-scan-adopt]").forEach(b =>
-        b.addEventListener("click", () => scanAdopt([{ name: b.dataset.scanAdopt, kind: b.dataset.scanAdoptKind }])));
+        b.addEventListener("click", () => scanAdopt([{ name: b.dataset.scanAdopt, kind: b.dataset.scanAdoptKind }], b)));
     backdrop.querySelectorAll("[data-scan-delete]").forEach(b =>
-        b.addEventListener("click", () => scanDeleteFiles([{ name: b.dataset.scanDelete, kind: b.dataset.scanDeleteKind }])));
+        b.addEventListener("click", () => scanDeleteFiles([{ name: b.dataset.scanDelete, kind: b.dataset.scanDeleteKind }], b)));
     const restoreAll = $("scan-restore-all");
-    if (restoreAll) restoreAll.addEventListener("click", () => {
+    if (restoreAll) restoreAll.addEventListener("click", async () => {
         const ids = S.scan.deleted.filter(x => x.canRestore).map(x => x.id);
-        if (ids.length && confirm(t("mods.scanRestoreConfirm", { n: ids.length }))) scanRestore(ids);
+        if (ids.length && await confirmModal(t("mods.scanRestoreConfirm", { n: ids.length }), { okLabel: "mods.scanRestore" })) scanRestore(ids, restoreAll);
     });
     const removeAll = $("scan-remove-all");
-    if (removeAll) removeAll.addEventListener("click", () => {
+    if (removeAll) removeAll.addEventListener("click", async () => {
         const ids = S.scan.deleted.map(x => x.id);
-        if (ids.length && confirm(t("mods.scanRemoveConfirm", { n: ids.length }))) scanRemoveEntries(ids);
+        if (ids.length && await confirmModal(t("mods.scanRemoveConfirm", { n: ids.length }), { danger: true, okLabel: "mods.scanRemoveEntry" })) scanRemoveEntries(ids, removeAll);
     });
     const adoptAll = $("scan-adopt-all");
-    if (adoptAll) adoptAll.addEventListener("click", () => {
+    if (adoptAll) adoptAll.addEventListener("click", async () => {
         const files = S.scan.added.map(f => ({ name: f.name, kind: f.kind || "mod" }));
-        if (files.length && confirm(t("mods.scanAdoptConfirm", { n: files.length }))) scanAdopt(files);
+        if (files.length && await confirmModal(t("mods.scanAdoptConfirm", { n: files.length }), { okLabel: "mods.scanAdopt" })) scanAdopt(files, adoptAll);
     });
     const deleteAll = $("scan-delete-all");
-    if (deleteAll) deleteAll.addEventListener("click", () => {
+    if (deleteAll) deleteAll.addEventListener("click", async () => {
         const files = S.scan.added.map(f => ({ name: f.name, kind: f.kind || "mod" }));
-        if (files.length && confirm(t("mods.scanDeleteConfirm", { n: files.length }))) scanDeleteFiles(files);
+        if (files.length && await confirmModal(t("mods.scanDeleteConfirm", { n: files.length }), { danger: true, okLabel: "mods.scanDeleteFile" })) scanDeleteFiles(files, deleteAll);
     });
 }
 
 /** Восстановить удалённые вручную файлы: обычная задача обновления по явному
  *  списку — отсутствующий файл скачивается даже без новой версии. Прогресс —
  *  в модалке обновления; кнопки скана снова разблокируются после финиша. */
-async function scanRestore(ids) {
+async function scanRestore(ids, btn) {
+    if (btn) btnBusy(btn, true); // 1.1.4: видно, что запрос ушёл
     const result = await api("mods/update", { method: "POST", body: { profile: S.currentProfile, ids } });
     if (result.ok && result.data && result.data.started) {
         S.scan.deleted = S.scan.deleted.filter(x => !ids.includes(x.id));
@@ -1335,7 +1483,8 @@ async function scanRestore(ids) {
 }
 
 /** Убрать записи из списка модпака — файлы уже отсутствуют на диске. */
-async function scanRemoveEntries(ids) {
+async function scanRemoveEntries(ids, btn) {
+    if (btn) btnBusy(btn, true);
     const result = await api("mods/remove", { method: "POST", body: { profile: S.currentProfile, ids } });
     if (result.ok) {
         const removed = result.data.removed || ids;
@@ -1350,7 +1499,8 @@ async function scanRemoveEntries(ids) {
 
 /** Принять добавленные вручную файлы в состав: сопоставление по хэшам
  *  Modrinth/CurseForge, без совпадения — локальная запись. */
-async function scanAdopt(files) {
+async function scanAdopt(files, btn) {
+    if (btn) btnBusy(btn, true);
     const result = await api("mods/import", { method: "POST", body: { profile: S.currentProfile, files } });
     if (!result.ok) {
         if (result.error && result.error.code === "update_in_progress") {
@@ -1375,7 +1525,8 @@ async function scanAdopt(files) {
 }
 
 /** Удалить добавленные вручную файлы с диска. */
-async function scanDeleteFiles(files) {
+async function scanDeleteFiles(files, btn) {
+    if (btn) btnBusy(btn, true);
     const result = await api("mods/clean", { method: "POST", body: { profile: S.currentProfile, files } });
     if (result.ok) {
         const names = new Set(files.map(f => (f.kind || "mod") + ":" + f.name));
@@ -1393,10 +1544,14 @@ async function scanDeleteFiles(files) {
  *  обновлений; в поиске на конкретный запрос его всё ещё можно поменять. */
 async function saveProfileLoader(loader) {
     if (!S.currentProfile) return;
+    // 1.1.4: селектор блокируется на время сохранения — видно, что применяется
+    const sel = $("pack-loader");
+    if (sel) sel.disabled = true;
     const result = await api("profiles/settings", {
         method: "POST",
         body: { profile: S.currentProfile, loader: loader },
     });
+    if (sel) sel.disabled = false;
     if (!result.ok) {
         toast(result.error ? result.error.message : t("common.error"), "error");
         renderPack(); // откатить селектор к прежнему значению
@@ -1490,14 +1645,23 @@ function isSuperAdmin() {
     return !!(S.session && S.session.role === "superadmin");
 }
 
-/** Дефолт фильтров — версия и загрузчик выбранного профиля (как в Prism Launcher).
- *  Для ресурспаков/шейдеров загрузчик профиля не применяется (только «Любой»). */
+/** Дефолт фильтров — версия игры и загрузчик выбранного профиля (как в Prism
+ *  Launcher). В поиске оба можно поменять руками — до следующей смены профиля
+ *  или сохранения нового дефолта загрузчика. Для ресурспаков/шейдеров
+ *  загрузчик профиля не применяется (только «Любой»). */
 function applyProfileFilters() {
     const profile = S.profiles.find(p => p.dir === S.currentProfile);
     S.search.lastProfile = S.currentProfile;
     S.search.gameVersion = (profile && profile.gameVersion) || "";
     const loaders = typeLoaders();
-    S.search.loader = loaders.includes(S.search.loader) ? S.search.loader : "any";
+    // 1.1.4: загрузчик профиля (задан админом или определён автоматически)
+    // подставляется в чипы как дефолт — раньше дефолт был всегда «Любой»
+    const profileLoader = (profile && profile.loader) || "";
+    if (profileLoader && loaders.includes(profileLoader)) {
+        S.search.loader = profileLoader;
+    } else if (!loaders.includes(S.search.loader)) {
+        S.search.loader = "any";
+    }
     S.search.offset = 0;
 }
 
@@ -1572,7 +1736,7 @@ async function renderCategoryList() {
     });
 }
 
-async function runSearch(reset) {
+async function runSearch(reset, scrollAfter) {
     if (!S.currentProfile) {
         $("search-grid").innerHTML = "";
         const empty = $("search-empty");
@@ -1587,6 +1751,15 @@ async function runSearch(reset) {
     if (reset) S.search.offset = 0;
     if (S.search.loading) return;
     S.search.loading = true;
+    // 1.1.4: новый поиск — скелетоны вместо старых результатов; перелистывание —
+    // старые результаты приглушаются, пока грузится следующая страница
+    const grid = $("search-grid");
+    if (reset) {
+        grid.innerHTML = skeletonCards(6);
+        $("search-empty").classList.add("hidden");
+    } else {
+        grid.classList.add("updating");
+    }
     $("search-meta").innerHTML =
         '<span class="spin" aria-hidden="true"></span><span class="muted small">' + esc(t("search.searching")) + "</span>";
     const s = S.search;
@@ -1604,6 +1777,10 @@ async function runSearch(reset) {
     if (s.cats.size) params.set("categories", Array.from(s.cats).join(","));
     const result = await api("mods/search?" + params.toString());
     S.search.loading = false;
+    grid.classList.remove("updating");
+    // 1.1.4: после перелистывания — к началу результатов (мета «Найдено N»),
+    // иначе пользователь остаётся у пагинатора с видом старой прокрутки
+    if (scrollAfter) scrollToAnchor($("search-meta"));
     if (!result.ok) {
         $("search-meta").innerHTML = "";
         $("search-grid").innerHTML = "";
@@ -1767,7 +1944,7 @@ async function suggestProject(source, projectId, btn) {
         toast(map[err.code] ? map[err.code]() : (err.message || t("common.error")), "error");
         if (btn) {
             btn.disabled = false;
-            btn.innerHTML = icon("send") + "<span>" + esc(t("suggest.button")) + "</span>";
+            btn.innerHTML = icon("send") + '<span data-i18n="suggest.button">' + esc(t("suggest.button")) + "</span>";
         }
     }
 }
@@ -1809,6 +1986,9 @@ function updateSearchPager() {
     const s = S.search;
     const pages = Math.max(1, Math.ceil(s.total / s.limit));
     const page = Math.floor(s.offset / s.limit) + 1;
+    // 1.1.4: одна страница — пагинатор не нужен, прячем целиком
+    const pager = $("btn-search-prev").closest(".pager");
+    if (pager) pager.classList.toggle("hidden", pages <= 1);
     $("search-page").textContent = pages > 1 ? t("search.page", { a: page, b: pages }) : "";
     $("btn-search-prev").disabled = page <= 1;
     $("btn-search-next").disabled = page >= pages;
@@ -1909,7 +2089,8 @@ function renderSuggestBans() {
     if (!ul) return;
     ul.innerHTML = "";
     if (!S.suggestBansLocal.length) {
-        ul.innerHTML = `<li class="muted">—</li>`;
+        // 1.1.4: вместо одинокого прочерка — понятная пустая заглушка
+        ul.innerHTML = `<li class="muted small" style="border:none;padding:2px 0">${esc(t("settings.suggestNoBans"))}</li>`;
         return;
     }
     S.suggestBansLocal.forEach(login => {
@@ -2071,7 +2252,7 @@ async function addMod(source, projectId, title) {
     const suggestions = (data.missingDependencies || []);
     if (suggestions.length) {
         const names = suggestions.map(s => s.name || s.projectId).join(", ");
-        if (confirm(t("mods.suggestDeps", { deps: names }))) {
+        if (await confirmModal(t("mods.suggestDeps", { deps: names }), { okLabel: "mods.add" })) {
             for (const dep of suggestions) {
                 await addMod(dep.source, dep.projectId, dep.name);
             }
@@ -2154,7 +2335,7 @@ function openSettings(mod) {
             ${relBlock}
         </div>`;
     const modal = openModal(body, [
-        { label: t("mods.save"), className: "btn primary", onclick: () => saveSettings(mod) },
+        { label: t("mods.save"), className: "btn primary", onclick: (ev) => saveSettings(mod, ev.currentTarget || ev.target) },
         { label: t("mods.cancel"), className: "btn", onclick: closeModal },
     ]);
     // Выбор «Новая группа…» показывает текстовое поле имени
@@ -2188,7 +2369,7 @@ function openSettings(mod) {
     return modal;
 }
 
-async function saveSettings(mod) {
+async function saveSettings(mod, btn) {
     const relList = $("modal-backdrop");
     const dependencies = Array.from(
         relList.querySelectorAll(".rel-list input[data-rel='dep']:checked")).map(i => i.dataset.id);
@@ -2211,6 +2392,7 @@ async function saveSettings(mod) {
             optionalGroup = groupSelect.value.trim();
         }
     }
+    if (btn) btnBusy(btn, true); // 1.1.4: индикация сохранения настроек записи
     const result = await api("mods/settings", {
         method: "POST",
         body: {
@@ -2224,6 +2406,7 @@ async function saveSettings(mod) {
             conflicts,
         },
     });
+    if (btn) btnBusy(btn, false);
     if (result.ok) {
         closeModal();
         await loadPack();
@@ -2233,6 +2416,26 @@ async function saveSettings(mod) {
 }
 
 /* ================= Модалки ================= */
+/** 1.1.4: подтверждение в стиле сайта вместо системного confirm():
+ *  единый вид, фокус-трап, Esc/клик по фону = «отмена». Возвращает Promise. */
+let confirmResolver = null;
+function confirmModal(message, opts) {
+    opts = opts || {};
+    return new Promise(resolve => {
+        const done = (v) => { confirmResolver = null; closeModal(); resolve(v); };
+        openModal(
+            '<h3 class="modal-title">' + esc(opts.title || t("common.confirmTitle")) + "</h3>"
+            + '<p class="confirm-text">' + esc(message) + "</p>",
+            [{ label: t("common.cancel"), className: "btn ghost", onclick: () => done(false) },
+             { label: t(opts.okLabel || "common.ok"), className: "btn " + (opts.danger ? "danger" : "primary"),
+               onclick: () => done(true) }]);
+        // ВАЖНО: резолвер ставится ПОСЛЕ openModal — его первый вызов closeModal()
+        // не должен принять подтверждение за «закрытое без ответа» (иначе Promise
+        // разрешался бы false мгновенно, до клика пользователя)
+        confirmResolver = resolve;
+    });
+}
+
 function openModal(bodyHtml, buttons) {
     closeModal();
     const backdrop = document.createElement("div");
@@ -2289,6 +2492,13 @@ function closeModal() {
     const existing = $("modal-backdrop");
     if (existing) existing.remove();
     stopThemePreview();
+    // открытое подтверждение закрыли без выбора (Esc/фон) — это «отмена»,
+    // иначе await confirmModal(...) висел бы навсегда
+    if (confirmResolver) {
+        const r = confirmResolver;
+        confirmResolver = null;
+        r(false);
+    }
 }
 
 /* Esc закрывает модалку */
@@ -2296,8 +2506,18 @@ document.addEventListener("keydown", (e) => {
     if (e.key === "Escape") closeModal();
 });
 
+/** 1.1.4: строка-заглушка «Загрузка…» для tbody — пока идёт первый запрос,
+ *  таблица не выглядит пустой/застывшей. */
+function tableLoadingRow(colspan) {
+    return '<tr class="loading-row" aria-hidden="true"><td colspan="' + colspan + '"><span class="spin"></span><span class="muted">' + esc(t("common.loading")) + "</span></td></tr>";
+}
+
 /* ================= Админ-панель ================= */
 async function loadBans() {
+    const bansBody0 = $("table-bans").querySelector("tbody");
+    const locksBody0 = $("table-locks").querySelector("tbody");
+    if (bansBody0) bansBody0.innerHTML = tableLoadingRow(5);
+    if (locksBody0) locksBody0.innerHTML = tableLoadingRow(4);
     const result = await api("bans");
     if (!result.ok) return;
     const data = result.data || {};
@@ -2318,7 +2538,7 @@ async function loadBans() {
             btn.type = "button";
             btn.className = "btn small danger";
             btn.innerHTML = icon("x") + "<span>" + esc(t("admin.unban")) + "</span>";
-            btn.addEventListener("click", () => unban(ip, null));
+            btn.addEventListener("click", () => unban(ip, null, btn));
             tr.lastElementChild.appendChild(btn);
             bansBody.appendChild(tr);
         }
@@ -2339,17 +2559,18 @@ async function loadBans() {
             btn.type = "button";
             btn.className = "btn small danger";
             btn.innerHTML = icon("x") + "<span>" + esc(t("admin.unlock")) + "</span>";
-            btn.addEventListener("click", () => unban(null, login));
+            btn.addEventListener("click", () => unban(null, login, btn));
             tr.lastElementChild.appendChild(btn);
             locksBody.appendChild(tr);
         }
     }
 }
 
-async function unban(ip, login) {
+async function unban(ip, login, btn) {
     const body = {};
     if (ip) body.ip = ip;
     if (login) body.login = login;
+    if (btn) btnBusy(btn, true); // 1.1.4: индикация до перерисовки таблицы
     await api("bans/unban", { method: "POST", body });
     await loadBans();
 }
@@ -2378,6 +2599,7 @@ function renderIpList(listId, entries, kind) {
         btn.title = t("admin.remove");
         btn.setAttribute("aria-label", t("admin.remove"));
         btn.addEventListener("click", async () => {
+            btnBusy(btn, true);
             await api("ipfilter", { method: "POST", body: { action: "remove", list: kind, ip: entry } });
             await loadIpFilter();
         });
@@ -2386,10 +2608,12 @@ function renderIpList(listId, entries, kind) {
     });
 }
 
-async function ipFilterAdd(kind, value) {
+async function ipFilterAdd(kind, value, btn) {
     const ip = value.trim();
     if (!ip) return;
+    if (btn) btnBusy(btn, true);
     const result = await api("ipfilter", { method: "POST", body: { action: "add", list: kind, ip } });
+    if (btn) btnBusy(btn, false);
     if (result.ok && result.data.success) {
         if (kind === "white") $("wl-input").value = "";
         else $("bl-input").value = "";
@@ -2400,13 +2624,16 @@ async function ipFilterAdd(kind, value) {
 }
 
 async function loadAudit() {
+    const pre = $("audit-log");
+    if (pre && !pre.textContent.trim()) pre.textContent = t("common.loading");
     const result = await api(`audit?offset=${S.auditOffset}&limit=60`);
     if (!result.ok) return;
-    const pre = $("audit-log");
     pre.textContent = (result.data.lines || []).join("\n") || "—";
 }
 
 async function loadUsers() {
+    const tbody0 = $("table-users").querySelector("tbody");
+    if (tbody0) tbody0.innerHTML = tableLoadingRow(5);
     const result = await api("users");
     if (!result.ok) return;
     const tbody = $("table-users").querySelector("tbody");
@@ -2435,10 +2662,12 @@ async function loadUsers() {
                 toast(t("common.error") + ": ≥6", "error");
                 return;
             }
+            btnBusy(setBtn, true); // 1.1.4: пока пароль применяется — спиннер
             const setResult = await api("users/password", {
                 method: "POST",
                 body: { login: account.login, newPassword },
             });
+            btnBusy(setBtn, false);
             if (setResult.ok) {
                 toast(t("common.done"), "success");
                 input.value = "";
@@ -2458,6 +2687,8 @@ async function loadUsers() {
  *  Эффективная роль: суперадмин > «наблюдатель» (оверрайд) > базовая роль источника. */
 async function loadAdminRoles() {
     if (!isSuperAdmin()) return;
+    const rolesTbody = $("table-admin-roles").querySelector("tbody");
+    if (rolesTbody) rolesTbody.innerHTML = tableLoadingRow(5);
     const result = await api("admins");
     if (!result.ok) {
         toast(result.error ? result.error.message : t("common.error"), "error");
@@ -2486,6 +2717,7 @@ async function loadAdminRoles() {
             btn.textContent = admin.forcedViewer ? t("admin.roles.allowAdmin") : t("admin.roles.makeViewer");
             btn.addEventListener("click", async () => {
                 const makeViewer = !admin.forcedViewer;
+                btnBusy(btn, true);
                 const res = await api("admins/override", {
                     method: "POST",
                     body: { login: admin.login, viewer: String(makeViewer) },
@@ -2518,10 +2750,13 @@ async function addForcedViewer() {
     if (!input) return;
     const login = (input.value || "").trim();
     if (!login) return;
+    const btn = $("viewer-add");
+    if (btn) btnBusy(btn, true);
     const res = await api("admins/override", {
         method: "POST",
         body: { login, viewer: "true" },
     });
+    if (btn) btnBusy(btn, false);
     if (res.ok) {
         toast(t("admin.roles.viewerSet"), "success");
         input.value = "";
@@ -2567,6 +2802,8 @@ async function loadSuggestions() {
     const params = new URLSearchParams();
     if (q) params.set("q", q);
     if (kind) params.set("kind", kind);
+    const suggestBody = $("table-suggest").querySelector("tbody");
+    if (suggestBody) suggestBody.innerHTML = tableLoadingRow(6);
     const result = await api("mods/suggestions" + (params.toString() ? "?" + params.toString() : ""));
     if (!result.ok) {
         toast(result.error ? result.error.message : t("common.error"), "error");
@@ -2688,10 +2925,26 @@ function switchMainTab(name) {
         const panel = $("panel-" + n);
         if (panel) panel.classList.toggle("hidden", name !== n);
     });
+    // 1.1.4: на узких экранах табы скроллятся — активный доводим до видимости
+    const activeTab = $("tab-" + name);
+    if (activeTab && activeTab.scrollIntoView) {
+        activeTab.scrollIntoView({ block: "nearest", inline: "nearest" });
+    }
     if (name === "settings") switchSettingsTab("updates");
     if (name === "search") onSearchTabOpen();
     if (name === "suggest") loadSuggestions();
     if (name === "backups") loadBackups();
+    updateNavHint();
+}
+
+/** 1.1.4: индикатор «табы продолжаются» — затухание у краёв навигации:
+ *  справа, пока не доскроллено до конца, и слева, если уже уехали вправо. */
+function updateNavHint() {
+    const nav = document.querySelector(".mainnav");
+    if (!nav) return;
+    const more = nav.scrollWidth > nav.clientWidth + 2;
+    nav.classList.toggle("can-scroll", more && nav.scrollLeft + nav.clientWidth < nav.scrollWidth - 2);
+    nav.classList.toggle("scrolled", nav.scrollLeft > 2);
 }
 
 /* ================= Темы оформления (1.1.0) ================= */
@@ -3110,7 +3363,9 @@ function renderAppearance() {
         listEl.innerHTML = "";
         BUILTIN_THEMES.forEach(theme => {
             const on = !disabled.includes(theme.id);
-            const row = document.createElement("div");
+            // 1.1.4: label вместо div — весь ряд одна тап-зона (сам чекбокс
+            // 22px, промахиваться на телефоне было легко)
+            const row = document.createElement("label");
             row.className = "theme-admin-row";
             row.innerHTML = '<span class="theme-swatch" style="background:' + themeSwatch(theme) + '"></span>'
                 + '<span class="theme-admin-name">' + esc(t(theme.key)) + "</span>"
@@ -3450,22 +3705,31 @@ document.addEventListener("DOMContentLoaded", async () => {
     });
     on("btn-search-prev", "click", () => {
         S.search.offset = Math.max(0, S.search.offset - S.search.limit);
-        runSearch(false);
+        runSearch(false, true);
     });
     on("btn-search-next", "click", () => {
         S.search.offset += S.search.limit;
-        runSearch(false);
+        runSearch(false, true);
     });
     on("btn-search-reset", "click", resetSearchFilters);
-    // аудит
+    // аудит: после перелистывания лога — к его началу, как в поиске.
+    // у pre свой скролл (max-height) — сбрасываем и его, и окно
+    const auditToTop = () => {
+        const pre = $("audit-log");
+        if (!pre) return;
+        pre.scrollTop = 0;
+        scrollToAnchor(pre);
+    };
     on("btn-audit-refresh", "click", loadAudit);
-    on("btn-audit-newer", "click", () => {
+    on("btn-audit-newer", "click", async () => {
         S.auditOffset = Math.max(0, S.auditOffset - 60);
-        loadAudit();
+        await loadAudit();
+        auditToTop();
     });
-    on("btn-audit-older", "click", () => {
+    on("btn-audit-older", "click", async () => {
         S.auditOffset += 60;
-        loadAudit();
+        await loadAudit();
+        auditToTop();
     });
     // ip-фильтр
     on("wl-add", "click", () => ipFilterAdd("white", $("wl-input").value));
@@ -3511,6 +3775,12 @@ async function loadBackups() {
         renderBackups({ backups: [], totalSize: 0, count: 0, job: null, folders: [] });
         return;
     }
+    // 1.1.4: пока идёт первый запрос — заглушки, чтобы таблица не выглядела
+    // пустой (или «застывшей» с прошлым профилем)
+    if (!S.backups) {
+        const tb = $("backups-tbody");
+        if (tb) tb.innerHTML = tableLoadingRow(5);
+    }
     const result = await api("backups?profile=" + encodeURIComponent(S.currentProfile));
     if (!result.ok) {
         toast(result.error ? result.error.message : t("common.error"), "error");
@@ -3533,7 +3803,9 @@ async function loadBackups() {
                 toast((last.ok ? t("backups.done") : t("backups.failed")) + ": " + last.message,
                         last.ok ? "success" : "error");
                 // состав модпака мог измениться — обновляем и его
-                loadMods(S.currentProfile);
+                // 1.1.4: раньше здесь вызывалась несуществующая loadMods() —
+                // TypeError после каждой завершёншейся задачи бекапа
+                loadPack();
             }
         }
     }
@@ -3625,7 +3897,17 @@ function backupRow(b, isAdmin) {
             + (b.foreign ? ' <span class="badge-foreign">' + esc(t("backups.foreignBadge")) + "</span>" : "")
             + (b.frozen ? ' <span class="badge-frozen">' + esc(t("backups.frozen")) + "</span>" : "");
     const date = document.createElement("td");
-    date.textContent = fmtTime(b.createdAt);
+    // 1.1.4: на телефоне время прячется (остаётся в title) — иначе колонка
+    // «Дата» со секундами отжимала у имени и кнопок ~60px
+    const fullTime = fmtTime(b.createdAt);
+    const commaPos = fullTime.lastIndexOf(",");
+    date.title = fullTime;
+    if (commaPos > 0) {
+        date.innerHTML = esc(fullTime.slice(0, commaPos))
+            + ' <span class="bk-time">' + esc(fullTime.slice(commaPos + 1).trim()) + "</span>";
+    } else {
+        date.textContent = fullTime;
+    }
     const size = document.createElement("td");
     size.textContent = fmtBytes(b.size);
     const content = document.createElement("td");
@@ -3637,7 +3919,7 @@ function backupRow(b, isAdmin) {
     if (isAdmin) {
         actions.appendChild(actionBtn("backups.rename", () => backupRenameModal(b), "note"));
         actions.appendChild(actionBtn(b.frozen ? "backups.unfreeze" : "backups.freeze",
-                () => backupFreeze(b, !b.frozen), "shield"));
+                (btn) => backupFreeze(b, !b.frozen, btn), "shield"));
         actions.appendChild(actionBtn("backups.download", () => backupDownload(b), "download"));
         actions.appendChild(actionBtn("backups.restore", () => backupRestoreModal(b), "refresh"));
         actions.appendChild(actionBtn("backups.delete", () => backupDeleteModal(b), "trash"));
@@ -3652,20 +3934,23 @@ function actionBtn(key, onclick, iconName) {
     btn.className = "btn ghost small";
     btn.title = t(key);
     btn.innerHTML = icon(iconName);
-    btn.addEventListener("click", onclick);
+    // 1.1.4: onclick получает саму кнопку — можно показать занятость
+    btn.addEventListener("click", () => onclick(btn));
     return btn;
 }
 
 async function createBackup() {
     if (!S.currentProfile) return;
     const btn = $("btn-backup-create");
-    btn.disabled = true;
     const name = $("backup-name").value.trim() || defaultBackupName();
+    // 1.1.4: кнопка показывает процесс запуска задачи (setBtnLoading вернёт
+    // иконку и подпись после ответа)
+    setBtnLoading(btn, "backups.creating", "plus", true);
     const result = await api("backups/create", {
         method: "POST",
         body: { profile: S.currentProfile, name: name },
     });
-    btn.disabled = false;
+    setBtnLoading(btn, "backups.create", "plus", false);
     if (result.ok) {
         toast(t("backups.started"), "success");
         $("backup-name").value = "";
@@ -3684,9 +3969,11 @@ function backupRenameModal(b) {
         },
         {
             label: t("mods.save"), className: "btn primary",
-            onclick: async () => {
+            onclick: async (ev) => {
                 const value = document.getElementById("backup-rename-input").value.trim();
                 if (!value) return;
+                const btn = ev ? ev.currentTarget || ev.target : null;
+                if (btn) btnBusy(btn, true); // 1.1.4: индикация сохранения
                 const result = await api("backups/rename", {
                     method: "POST",
                     body: { profile: S.currentProfile, id: b.id, name: value },
@@ -3704,7 +3991,8 @@ function backupRenameModal(b) {
     return modal;
 }
 
-async function backupFreeze(b, frozen) {
+async function backupFreeze(b, frozen, btn) {
+    if (btn) btnBusy(btn, true);
     const result = await api("backups/freeze", {
         method: "POST",
         body: { profile: S.currentProfile, id: b.id, frozen: frozen },
@@ -3726,12 +4014,14 @@ function backupRestoreModal(b) {
                 { label: t("common.cancel"), className: "btn ghost", onclick: closeModal },
                 {
                     label: t("backups.restore"), className: "btn primary",
-                    onclick: async () => {
-                        closeModal();
+                    onclick: async (ev) => {
+                        const btn = ev ? ev.currentTarget || ev.target : null;
+                        if (btn) btnBusy(btn, true);
                         const result = await api("backups/restore", {
                             method: "POST",
                             body: { profile: S.currentProfile, id: b.id },
                         });
+                        closeModal();
                         if (result.ok) {
                             toast(t("backups.restoreStarted"), "success");
                             S.backupsJobSeen = true;
@@ -3756,12 +4046,14 @@ function backupDeleteModal(b) {
                 { label: t("common.cancel"), className: "btn ghost", onclick: closeModal },
                 {
                     label: t("backups.delete"), className: "btn danger",
-                    onclick: async () => {
-                        closeModal();
+                    onclick: async (ev) => {
+                        const btn = ev ? ev.currentTarget || ev.target : null;
+                        if (btn) btnBusy(btn, true);
                         const result = await api("backups/delete", {
                             method: "POST",
                             body: { profile: S.currentProfile, id: b.id },
                         });
+                        closeModal();
                         if (result.ok) {
                             toast(t("backups.deleted"), "success");
                             loadBackups();
@@ -3794,10 +4086,13 @@ async function saveBackupFolders() {
         toast(t("backups.foldersNone"), "warn");
         return;
     }
+    const btn = $("btn-backup-folders-save");
+    if (btn) btnBusy(btn, true);
     const result = await api("backups/folders", {
         method: "POST",
         body: { profile: S.currentProfile, folders: folders },
     });
+    if (btn) btnBusy(btn, false);
     if (result.ok) {
         S.backupsFoldersDirty = false;
         toast(t("backups.foldersSaved"), "success");
@@ -3810,10 +4105,13 @@ async function saveBackupFolders() {
 async function resetBackupFolders() {
     if (!S.currentProfile) return;
     // Пустой список = дефолт (три стандартные папки контента)
+    const btn = $("btn-backup-folders-reset");
+    if (btn) btnBusy(btn, true);
     const result = await api("backups/folders", {
         method: "POST",
         body: { profile: S.currentProfile, folders: [] },
     });
+    if (btn) btnBusy(btn, false);
     if (result.ok) {
         S.backupsFoldersDirty = false;
         toast(t("backups.foldersSaved"), "success");

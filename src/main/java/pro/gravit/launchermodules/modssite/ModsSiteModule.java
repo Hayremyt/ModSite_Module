@@ -49,8 +49,8 @@ import java.util.concurrent.TimeUnit;
  * (эскалация банов IP, whitelist/blacklist), TOTP, аудит.
  */
 public class ModsSiteModule extends LauncherModule {
-    public static final Version version = new Version(1, 1, 2, 0, Version.Type.LTS);
-    public final String versionString = "1.1.2";
+    public static final Version version = new Version(1, 1, 4, 0, Version.Type.LTS);
+    public final String versionString = "1.1.4";
     public final Logger logger = LogManager.getLogger(ModsSiteModule.class);
 
     // Состояние и сервисы (инициализируются в init)
